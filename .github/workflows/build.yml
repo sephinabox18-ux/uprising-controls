@@ -29,7 +29,7 @@ jobs:
 
       - name: Apply KIU changes
         working-directory: azahar
-        run: git apply --whitespace=nowarn ../kiu/kiu.patch
+        run: git apply --whitespace=nowarn ../kiu/.github/workflows/kiu.patch
 
       - name: Cache
         uses: actions/cache@v4
@@ -51,7 +51,7 @@ jobs:
       - name: Build APK
         working-directory: azahar/src/android
         env:
-          ANDROID_KEYSTORE_FILE: ${{ github.workspace }}/kiu/kiu-signing.jks
+          ANDROID_KEYSTORE_FILE: ${{ github.workspace }}/kiu/.github/workflows/kiu-signing.jks
           ANDROID_KEY_ALIAS: kiu
           ANDROID_KEYSTORE_PASS: kiupassword
         run: |
