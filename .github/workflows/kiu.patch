@@ -1,0 +1,616 @@
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index d873af1..1be1f5c 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -63,7 +63,7 @@ android {
+     defaultConfig {
+         // The application ID refers to Lime3DS to allow for
+         // the Play Store listing, which was originally set up for Lime3DS, to still be used.
+-        applicationId = "org.azahar_emu.azahar"
++        applicationId = "org.azahar_emu.azahar.kiu"
+         minSdk = 29
+         targetSdk = 37
+         versionCode = autoVersion
+diff --git a/src/android/app/src/main/java/org/citra/citra_emu/overlay/InputOverlay.kt b/src/android/app/src/main/java/org/citra/citra_emu/overlay/InputOverlay.kt
+index 06c5ff2..efe130f 100644
+--- a/src/android/app/src/main/java/org/citra/citra_emu/overlay/InputOverlay.kt
++++ b/src/android/app/src/main/java/org/citra/citra_emu/overlay/InputOverlay.kt
+@@ -55,6 +55,9 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
+     // Stores the ID of the pointer that interacted with the 3DS touchscreen.
+     private var touchscreenPointerId = -1
+ 
++    // Kid Icarus: Uprising touch mode
++    private val kiu = KiuController(this)
++
+     init {
+         if (!preferences.getBoolean("OverlayInit", false)) {
+             defaultOverlay()
+@@ -76,8 +79,17 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
+         requestFocus()
+     }
+ 
++    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
++        super.onSizeChanged(w, h, oldw, oldh)
++        kiu.onSizeChanged(w, h)
++    }
++
+     override fun draw(canvas: Canvas) {
+         super.draw(canvas)
++        if (kiu.isActive && !isInEditMode) {
++            kiu.draw(canvas)
++            return
++        }
+         overlayButtons.forEach { it.draw(canvas) }
+         overlayDpads.forEach { it.draw(canvas) }
+         overlayJoysticks.forEach { it.draw(canvas) }
+@@ -102,6 +114,9 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
+         if (isInEditMode) {
+             return onTouchWhileEditing(event)
+         }
++        if (kiu.isActive) {
++            return kiu.onTouch(event)
++        }
+ 
+         val motionEvent = event.action and MotionEvent.ACTION_MASK
+         val isActionDown =
+diff --git a/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt b/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt
+new file mode 100644
+index 0000000..796dfd0
+--- /dev/null
++++ b/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt
+@@ -0,0 +1,542 @@
++// Personal modification for playing Kid Icarus: Uprising with phone-native touch controls.
++// Licensed under GPLv2 or any later version, same as Azahar.
++
++package org.citra.citra_emu.overlay
++
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.RectF
++import android.view.HapticFeedbackConstants
++import android.view.MotionEvent
++import androidx.preference.PreferenceManager
++import kotlin.math.max
++import kotlin.math.min
++import kotlin.math.sqrt
++import org.citra.citra_emu.CitraApplication
++import org.citra.citra_emu.NativeLibrary
++import org.citra.citra_emu.features.settings.model.BooleanSetting
++import org.citra.citra_emu.features.settings.model.IntSetting
++import org.citra.citra_emu.features.settings.model.Settings
++import org.citra.citra_emu.features.settings.utils.SettingsFile
++import org.citra.citra_emu.utils.EmulationMenuSettings
++
++/**
++ * "KIU mode": every action happens on the 3DS top screen.
++ *
++ * Game mode:
++ *  - Top screen fills the phone height, centred. 3DS bottom screen is shown small in the
++ *    top-left strip (tap it for powers / specials).
++ *  - Left half: floating joystick (Circle Pad).
++ *  - Right half: aim pad. Touches are forwarded to the hidden bottom screen as stylus input.
++ *    With auto-fire on, touching the aim pad also holds L (fire).
++ *  - Right strip: MENU, START, A, B, POWER (D-pad Down), AF toggle, FIRE (L).
++ *
++ * Menu mode (MENU button): bottom screen shown large in the centre for touch menus,
++ * top screen shown small top-left.
++ */
++class KiuController(private val overlay: InputOverlay) {
++
++    private class KiuButton(val label: String, val action: Int) {
++        val rect = RectF()
++        var pointerId = -1
++        val pressed get() = pointerId != -1
++    }
++
++    private val density = overlay.resources.displayMetrics.density
++    private fun dp(v: Float) = v * density
++
++    private val prefs get() = PreferenceManager.getDefaultSharedPreferences(CitraApplication.appContext)
++
++    private var viewW = 0
++    private var viewH = 0
++    private var laidOut = false
++
++    var menuMode = false
++        private set
++    private var autoFire = prefs.getBoolean(PREF_AUTOFIRE, true)
++
++    // Where the 3DS screens are drawn in the current mode
++    private val bigRect = RectF()   // top screen (game) or bottom screen (menu)
++    private val miniRect = RectF()  // bottom screen (game) or top screen (menu)
++
++    private val buttons = listOf(
++        KiuButton("MENU", ACTION_MENU),
++        KiuButton("START", NativeLibrary.ButtonType.BUTTON_START),
++        KiuButton("A", NativeLibrary.ButtonType.BUTTON_A),
++        KiuButton("B", NativeLibrary.ButtonType.BUTTON_B),
++        KiuButton("POWER", NativeLibrary.ButtonType.DPAD_DOWN),
++        KiuButton("AF", ACTION_AUTOFIRE),
++        KiuButton("FIRE", NativeLibrary.ButtonType.TRIGGER_L)
++    )
++
++    // Joystick state
++    private var stickId = -1
++    private var stickCx = 0f
++    private var stickCy = 0f
++    private var stickX = 0f
++    private var stickY = 0f
++    private val stickRadius get() = dp(STICK_RADIUS_DP)
++
++    // Aim state
++    private var aimId = -1
++    private var aimX = 0f
++    private var aimY = 0f
++
++    // Direct bottom-screen touch (mini screen in game mode, big screen in menu mode)
++    private var directId = -1
++
++    // Number of sources currently holding L (aim auto-fire + FIRE button)
++    private var lHolders = 0
++    private var aimHoldsL = false
++
++    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
++    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        style = Paint.Style.STROKE
++        strokeWidth = dp(2f)
++        color = Color.argb(150, 255, 255, 255)
++    }
++    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        color = Color.argb(220, 255, 255, 255)
++        textAlign = Paint.Align.CENTER
++        textSize = dp(14f)
++        isFakeBoldText = true
++    }
++
++    val isActive: Boolean
++        get() = laidOut && viewW > viewH && prefs.getBoolean(PREF_ENABLED, true)
++
++    fun onSizeChanged(width: Int, height: Int) {
++        viewW = width
++        viewH = height
++        if (width <= 0 || height <= 0 || width <= height) {
++            laidOut = false
++            return
++        }
++        laidOut = true
++        releaseAll()
++        // Make sure the emulator isn't swapping screens on top of our own layout
++        if (EmulationMenuSettings.swapScreens) {
++            EmulationMenuSettings.swapScreens = false
++            NativeLibrary.swapScreens(false, overlay.display?.rotation ?: 0)
++        }
++        layoutButtons()
++        applyScreenLayout()
++    }
++
++    private fun layoutButtons() {
++        val w = viewW.toFloat()
++        val h = viewH.toFloat()
++        val gameW = min(w, h * 5f / 3f)
++        val stripLeft = (w + gameW) / 2f
++        var stripW = w - stripLeft
++        val minStrip = dp(150f)
++        val left = if (stripW < minStrip) w - minStrip else stripLeft
++        stripW = w - left
++
++        val pad = dp(6f)
++        val colW = (stripW - pad * 3f) / 2f
++        val btnH = min(colW * 0.8f, dp(64f))
++        val col1 = left + pad
++        val col2 = left + pad * 2f + colW
++
++        var y = pad + dp(8f)
++        fun place(b: KiuButton, x: Float, top: Float, bw: Float, bh: Float) {
++            b.rect.set(x, top, x + bw, top + bh)
++        }
++        place(buttons[0], col1, y, colW, btnH) // MENU
++        place(buttons[1], col2, y, colW, btnH) // START
++        y += btnH + pad
++        place(buttons[2], col1, y, colW, btnH) // A
++        place(buttons[3], col2, y, colW, btnH) // B
++        y += btnH + pad
++        place(buttons[4], col1, y, colW, btnH) // POWER
++        place(buttons[5], col2, y, colW, btnH) // AF
++
++        // Big FIRE button at the bottom of the strip
++        val fireH = min(stripW - pad * 2f, h * 0.28f)
++        place(buttons[6], left + pad, h - pad - fireH - dp(8f), stripW - pad * 2f, fireH)
++    }
++
++    /** Writes a custom layout to the emulator config and applies it. */
++    private fun applyScreenLayout() {
++        val w = viewW.toFloat()
++        val h = viewH.toFloat()
++        val pad = dp(6f)
++
++        if (!menuMode) {
++            val gw = min(w, h * 5f / 3f)
++            val gh = gw * 3f / 5f
++            bigRect.set((w - gw) / 2f, (h - gh) / 2f, (w + gw) / 2f, (h + gh) / 2f)
++            val strip = bigRect.left
++            val mw = max(strip - pad * 2f, dp(120f))
++            miniRect.set(pad, pad, pad + mw, pad + mw * 0.75f)
++            writeLayout(top = bigRect, bottom = miniRect)
++        } else {
++            val bw = min(w, h * 4f / 3f)
++            val bh = bw * 0.75f
++            bigRect.set((w - bw) / 2f, (h - bh) / 2f, (w + bw) / 2f, (h + bh) / 2f)
++            val strip = bigRect.left
++            val mw = max(strip - pad * 2f, dp(120f))
++            miniRect.set(pad, pad, pad + mw, pad + mw * 0.6f)
++            writeLayout(top = miniRect, bottom = bigRect)
++        }
++    }
++
++    private fun writeLayout(top: RectF, bottom: RectF) {
++        val settings: Settings = NativeLibrary.sEmulationActivity.get()?.settingsViewModel?.settings
++            ?: return
++        val values = listOf(
++            IntSetting.SCREEN_LAYOUT to LAYOUT_CUSTOM,
++            IntSetting.LANDSCAPE_TOP_X to top.left.toInt(),
++            IntSetting.LANDSCAPE_TOP_Y to top.top.toInt(),
++            IntSetting.LANDSCAPE_TOP_WIDTH to top.width().toInt(),
++            IntSetting.LANDSCAPE_TOP_HEIGHT to top.height().toInt(),
++            IntSetting.LANDSCAPE_BOTTOM_X to bottom.left.toInt(),
++            IntSetting.LANDSCAPE_BOTTOM_Y to bottom.top.toInt(),
++            IntSetting.LANDSCAPE_BOTTOM_WIDTH to bottom.width().toInt(),
++            IntSetting.LANDSCAPE_BOTTOM_HEIGHT to bottom.height().toInt()
++        )
++        for ((setting, value) in values) {
++            setting.int = value
++            settings.saveSetting(setting, SettingsFile.FILE_NAME_CONFIG)
++        }
++        // The emulator's own screen swap must stay off; KIU mode positions the screens itself
++        if (BooleanSetting.SWAP_SCREEN.boolean) {
++            BooleanSetting.SWAP_SCREEN.boolean = false
++            settings.saveSetting(BooleanSetting.SWAP_SCREEN, SettingsFile.FILE_NAME_CONFIG)
++        }
++        NativeLibrary.reloadSettings()
++        NativeLibrary.updateFramebuffer(false)
++    }
++
++    // ---------------------------------------------------------------- touch
++
++    fun onTouch(event: MotionEvent): Boolean {
++        when (event.actionMasked) {
++            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
++                val i = event.actionIndex
++                onDown(event.getPointerId(i), event.getX(i), event.getY(i))
++            }
++
++            MotionEvent.ACTION_MOVE -> {
++                for (i in 0 until event.pointerCount) {
++                    onMove(event.getPointerId(i), event.getX(i), event.getY(i))
++                }
++            }
++
++            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
++                onUp(event.getPointerId(event.actionIndex))
++            }
++
++            MotionEvent.ACTION_CANCEL -> releaseAll()
++        }
++        overlay.invalidate()
++        return true
++    }
++
++    private fun onDown(id: Int, x: Float, y: Float) {
++        // Buttons first (slightly enlarged hit areas)
++        val slop = dp(6f)
++        for (b in buttons) {
++            if (b.pointerId == -1 &&
++                x >= b.rect.left - slop && x <= b.rect.right + slop &&
++                y >= b.rect.top - slop && y <= b.rect.bottom + slop
++            ) {
++                pressButton(b, id)
++                return
++            }
++        }
++
++        if (menuMode) {
++            // Menu mode: big screen is the touch screen
++            if (directId == -1 && bigRect.contains(x, y)) {
++                directId = id
++                NativeLibrary.onTouchEvent(x, y, true)
++            }
++            return
++        }
++
++        // Game mode
++        if (directId == -1 && miniRect.contains(x, y)) {
++            directId = id
++            if (aimId != -1) {
++                // The 3DS has a single touch point: the tap on the mini screen wins
++                NativeLibrary.onTouchEvent(0f, 0f, false)
++            }
++            NativeLibrary.onTouchEvent(x, y, true)
++            return
++        }
++
++        if (x < viewW / 2f) {
++            if (stickId == -1) {
++                stickId = id
++                stickCx = x
++                stickCy = y
++                stickX = 0f
++                stickY = 0f
++                sendStick()
++            }
++        } else {
++            if (aimId == -1) {
++                aimId = id
++                aimX = x
++                aimY = y
++                if (directId == -1) {
++                    val (fx, fy) = aimToFramebuffer(x, y)
++                    NativeLibrary.onTouchEvent(fx, fy, true)
++                }
++                if (autoFire) {
++                    aimHoldsL = true
++                    holdL(true)
++                }
++            }
++        }
++    }
++
++    private fun onMove(id: Int, x: Float, y: Float) {
++        when (id) {
++            stickId -> {
++                var dx = x - stickCx
++                var dy = y - stickCy
++                val r = stickRadius
++                val dist = sqrt(dx * dx + dy * dy)
++                // Let the stick base follow the thumb if it drifts far away
++                val followAt = r * 1.4f
++                if (dist > followAt) {
++                    val excess = (dist - followAt) / dist
++                    stickCx += dx * excess
++                    stickCy += dy * excess
++                    dx = x - stickCx
++                    dy = y - stickCy
++                }
++                var nx = dx / r
++                var ny = dy / r
++                val len = sqrt(nx * nx + ny * ny)
++                if (len > 1f) {
++                    nx /= len
++                    ny /= len
++                }
++                stickX = nx
++                stickY = ny
++                sendStick()
++            }
++
++            aimId -> {
++                aimX = x
++                aimY = y
++                if (directId == -1) {
++                    val (fx, fy) = aimToFramebuffer(x, y)
++                    NativeLibrary.onTouchMoved(fx, fy)
++                }
++            }
++
++            directId -> NativeLibrary.onTouchMoved(x, y)
++        }
++    }
++
++    private fun onUp(id: Int) {
++        for (b in buttons) {
++            if (b.pointerId == id) {
++                releaseButton(b)
++                return
++            }
++        }
++        when (id) {
++            stickId -> {
++                stickId = -1
++                stickX = 0f
++                stickY = 0f
++                sendStick()
++            }
++
++            aimId -> {
++                aimId = -1
++                if (directId == -1) NativeLibrary.onTouchEvent(0f, 0f, false)
++                releaseAimFire()
++            }
++
++            directId -> {
++                directId = -1
++                NativeLibrary.onTouchEvent(0f, 0f, false)
++                if (!menuMode && aimId != -1) {
++                    // Hand the touch point back to the aim pad
++                    val (fx, fy) = aimToFramebuffer(aimX, aimY)
++                    NativeLibrary.onTouchEvent(fx, fy, true)
++                }
++            }
++        }
++    }
++
++    /** Maps a touch on the right half of the phone to a point on the (small) bottom screen. */
++    private fun aimToFramebuffer(x: Float, y: Float): Pair<Float, Float> {
++        val zoneLeft = viewW / 2f
++        val nx = ((x - zoneLeft) / (viewW - zoneLeft)).coerceIn(0f, 1f)
++        val ny = (y / viewH).coerceIn(0f, 1f)
++        val fx = miniRect.left + 1f + nx * (miniRect.width() - 2f)
++        val fy = miniRect.top + 1f + ny * (miniRect.height() - 2f)
++        return Pair(fx, fy)
++    }
++
++    private fun releaseAimFire() {
++        if (aimHoldsL) {
++            aimHoldsL = false
++            holdL(false)
++        }
++    }
++
++    private fun sendStick() {
++        NativeLibrary.onGamePadMoveEvent(
++            NativeLibrary.TOUCHSCREEN_DEVICE,
++            NativeLibrary.ButtonType.STICK_LEFT,
++            stickX,
++            stickY
++        )
++    }
++
++    private fun holdL(press: Boolean) {
++        val before = lHolders
++        lHolders = if (press) lHolders + 1 else max(0, lHolders - 1)
++        if (before == 0 && lHolders > 0) {
++            sendButton(NativeLibrary.ButtonType.TRIGGER_L, true)
++        } else if (before > 0 && lHolders == 0) {
++            sendButton(NativeLibrary.ButtonType.TRIGGER_L, false)
++        }
++    }
++
++    private fun sendButton(button: Int, press: Boolean) {
++        NativeLibrary.onGamePadEvent(
++            NativeLibrary.TOUCHSCREEN_DEVICE,
++            button,
++            if (press) NativeLibrary.ButtonState.PRESSED else NativeLibrary.ButtonState.RELEASED
++        )
++    }
++
++    private fun pressButton(b: KiuButton, id: Int) {
++        b.pointerId = id
++        overlay.hapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
++        when (b.action) {
++            ACTION_MENU -> toggleMenuMode()
++            ACTION_AUTOFIRE -> {
++                releaseAimFire()
++                autoFire = !autoFire
++                prefs.edit().putBoolean(PREF_AUTOFIRE, autoFire).apply()
++            }
++
++            NativeLibrary.ButtonType.TRIGGER_L -> holdL(true)
++            else -> sendButton(b.action, true)
++        }
++    }
++
++    private fun releaseButton(b: KiuButton) {
++        b.pointerId = -1
++        when (b.action) {
++            ACTION_MENU, ACTION_AUTOFIRE -> {}
++            NativeLibrary.ButtonType.TRIGGER_L -> holdL(false)
++            else -> sendButton(b.action, false)
++        }
++    }
++
++    private fun toggleMenuMode() {
++        // Let go of everything except the MENU button itself
++        if (stickId != -1) {
++            stickId = -1
++            stickX = 0f
++            stickY = 0f
++            sendStick()
++        }
++        if (aimId != -1 || directId != -1) {
++            NativeLibrary.onTouchEvent(0f, 0f, false)
++        }
++        releaseAimFire()
++        aimId = -1
++        directId = -1
++        menuMode = !menuMode
++        applyScreenLayout()
++    }
++
++    private fun releaseAll() {
++        for (b in buttons) {
++            if (b.pressed) releaseButton(b)
++        }
++        if (stickId != -1) {
++            stickId = -1
++            stickX = 0f
++            stickY = 0f
++            sendStick()
++        }
++        if (aimId != -1 || directId != -1) {
++            NativeLibrary.onTouchEvent(0f, 0f, false)
++        }
++        aimId = -1
++        directId = -1
++        aimHoldsL = false
++        if (lHolders > 0) {
++            lHolders = 0
++            sendButton(NativeLibrary.ButtonType.TRIGGER_L, false)
++        }
++    }
++
++    // ---------------------------------------------------------------- drawing
++
++    fun draw(canvas: Canvas) {
++        // Frame around the small screen
++        canvas.drawRoundRect(miniRect, dp(4f), dp(4f), strokePaint)
++
++        for (b in buttons) {
++            val label = if (b.action == ACTION_AUTOFIRE) {
++                if (autoFire) "AF ON" else "AF OFF"
++            } else if (b.action == ACTION_MENU) {
++                if (menuMode) "GAME" else "MENU"
++            } else {
++                b.label
++            }
++            val active = b.pressed || (b.action == ACTION_AUTOFIRE && autoFire)
++            fillPaint.color = if (active) {
++                Color.argb(150, 120, 170, 255)
++            } else {
++                Color.argb(70, 255, 255, 255)
++            }
++            val r = dp(12f)
++            canvas.drawRoundRect(b.rect, r, r, fillPaint)
++            canvas.drawRoundRect(b.rect, r, r, strokePaint)
++            canvas.drawText(
++                label,
++                b.rect.centerX(),
++                b.rect.centerY() - (textPaint.descent() + textPaint.ascent()) / 2f,
++                textPaint
++            )
++        }
++
++        if (menuMode) return
++
++        // Joystick
++        val r = stickRadius
++        if (stickId != -1) {
++            fillPaint.color = Color.argb(50, 255, 255, 255)
++            canvas.drawCircle(stickCx, stickCy, r, fillPaint)
++            canvas.drawCircle(stickCx, stickCy, r, strokePaint)
++            fillPaint.color = Color.argb(140, 255, 255, 255)
++            canvas.drawCircle(stickCx + stickX * r, stickCy + stickY * r, r * 0.45f, fillPaint)
++        } else {
++            // Faint hint of where the stick usually lives
++            strokePaint.alpha = 50
++            canvas.drawCircle(bigRect.left + r * 1.3f, viewH - r * 1.6f, r, strokePaint)
++            strokePaint.alpha = 150
++        }
++
++        // Aim touch marker
++        if (aimId != -1) {
++            canvas.drawCircle(aimX, aimY, dp(22f), strokePaint)
++        }
++    }
++
++    companion object {
++        private const val ACTION_MENU = -1001
++        private const val ACTION_AUTOFIRE = -1002
++        private const val LAYOUT_CUSTOM = 5
++        private const val STICK_RADIUS_DP = 60f
++        const val PREF_ENABLED = "kiu_enabled"
++        const val PREF_AUTOFIRE = "kiu_autofire"
++    }
++}
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 12bb68c..92d47b6 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -2,7 +2,7 @@
+ <resources>
+ 
+     <!-- General application strings -->
+-    <string name="app_name" translatable="false">Azahar</string>
++    <string name="app_name" translatable="false">Azahar KIU</string>
+     <string name="app_disclaimer">This software will run applications for the Nintendo 3DS handheld game console. No game titles are included.\n\nBefore you can begin with emulating, please select a folder to store Azahar\'s user data in.\n\nWhat\'s this:\n<a href='https://github.com/azahar-emu/azahar/wiki/Android-User-Data-and-Storage'>Wiki - Citra Android user data and storage</a></string>
+     <string name="app_notification_channel_name" translatable="false">Azahar</string>
+     <string name="app_notification_channel_id" translatable="false">Azahar</string>

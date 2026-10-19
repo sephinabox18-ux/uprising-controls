@@ -1,1 +1,70 @@
+name: Build Azahar KIU
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  AZAHAR_TAG: "2126.2"
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+    steps:
+      - name: Get this repo (patch + signing key)
+        uses: actions/checkout@v4
+        with:
+          path: kiu
+
+      - name: Get Azahar source
+        run: |
+          git clone --depth 1 --branch "$AZAHAR_TAG" --recurse-submodules --shallow-submodules \
+            https://github.com/azahar-emu/azahar.git azahar
+
+      - name: Apply KIU changes
+        working-directory: azahar
+        run: git apply --whitespace=nowarn ../kiu/kiu.patch
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ env.CCACHE_DIR }}
+          key: kiu-${{ env.AZAHAR_TAG }}-${{ github.sha }}
+          restore-keys: |
+            kiu-${{ env.AZAHAR_TAG }}-
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install ccache -y
+          echo "y" | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "cmake;3.30.3"
+
+      - name: Build APK
+        working-directory: azahar/src/android
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ github.workspace }}/kiu/kiu-signing.jks
+          ANDROID_KEY_ALIAS: kiu
+          ANDROID_KEYSTORE_PASS: kiupassword
+        run: |
+          export NDK_CCACHE=$(which ccache)
+          export JAVA_HOME=$JAVA_HOME_17_X64
+          chmod +x ./gradlew
+          ./gradlew assembleVanillaRelease
+          mkdir -p $GITHUB_WORKSPACE/out
+          find app/build/outputs/apk -name "*.apk" -exec cp {} $GITHUB_WORKSPACE/out/Azahar-KIU.apk \;
+          ls -la $GITHUB_WORKSPACE/out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Azahar-KIU-apk
+          path: out/Azahar-KIU.apk
