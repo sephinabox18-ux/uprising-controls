@@ -55,24 +55,37 @@ index 06c5ff2..efe130f 100644
          val isActionDown =
 diff --git a/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt b/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt
 new file mode 100644
-index 0000000..796dfd0
+index 0000000..a36cbf9
 --- /dev/null
 +++ b/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt
-@@ -0,0 +1,542 @@
+@@ -0,0 +1,1065 @@
 +// Personal modification for playing Kid Icarus: Uprising with phone-native touch controls.
 +// Licensed under GPLv2 or any later version, same as Azahar.
 +
 +package org.citra.citra_emu.overlay
 +
++import android.content.Context
 +import android.graphics.Canvas
 +import android.graphics.Color
 +import android.graphics.Paint
++import android.graphics.Path
 +import android.graphics.RectF
++import android.graphics.Typeface
++import android.os.SystemClock
 +import android.view.HapticFeedbackConstants
 +import android.view.MotionEvent
++import android.widget.LinearLayout
++import android.widget.ScrollView
++import android.widget.TextView
++import android.widget.Toast
 +import androidx.preference.PreferenceManager
++import com.google.android.material.dialog.MaterialAlertDialogBuilder
++import com.google.android.material.materialswitch.MaterialSwitch
++import com.google.android.material.slider.Slider
++import kotlin.math.abs
 +import kotlin.math.max
 +import kotlin.math.min
++import kotlin.math.roundToInt
 +import kotlin.math.sqrt
 +import org.citra.citra_emu.CitraApplication
 +import org.citra.citra_emu.NativeLibrary
@@ -83,25 +96,39 @@ index 0000000..796dfd0
 +import org.citra.citra_emu.utils.EmulationMenuSettings
 +
 +/**
-+ * "KIU mode": every action happens on the 3DS top screen.
++ * "KIU mode" for Kid Icarus: Uprising.
 + *
-+ * Game mode:
-+ *  - Top screen fills the phone height, centred. 3DS bottom screen is shown small in the
-+ *    top-left strip (tap it for powers / specials).
-+ *  - Left half: floating joystick (Circle Pad).
-+ *  - Right half: aim pad. Touches are forwarded to the hidden bottom screen as stylus input.
-+ *    With auto-fire on, touching the aim pad also holds L (fire).
-+ *  - Right strip: MENU, START, A, B, POWER (D-pad Down), AF toggle, FIRE (L).
++ * Game view: top screen fills the phone height in the centre. The 3DS bottom screen sits small
++ * in the left black bar. Tap it to swap (bottom screen big, top screen small); tap the small
++ * screen again to swap back. The strip along the bottom of the small bottom screen passes taps
++ * through to the game so powers and specials can be used without swapping.
 + *
-+ * Menu mode (MENU button): bottom screen shown large in the centre for touch menus,
-+ * top screen shown small top-left.
++ * Left half: floating joystick (Circle Pad) with optional dash assist.
++ * Right half: aim pad, forwarded to the hidden bottom screen as stylus input.
++ * Buttons can be moved and resized in the layout editor (settings cog).
 + */
 +class KiuController(private val overlay: InputOverlay) {
 +
-+    private class KiuButton(val label: String, val action: Int) {
-+        val rect = RectF()
++    private enum class Show { ALWAYS, GAME, MENU }
++
++    private class KiuButton(
++        val id: String,
++        val label: String,
++        val action: Int,
++        val show: Show
++    ) {
++        var cx = 0f
++        var cy = 0f
++        var size = 0f // diameter in px
 +        var pointerId = -1
++        var downTime = 0L
 +        val pressed get() = pointerId != -1
++        fun contains(x: Float, y: Float, slop: Float): Boolean {
++            val dx = x - cx
++            val dy = y - cy
++            val r = size / 2f + slop
++            return dx * dx + dy * dy <= r * r
++        }
 +    }
 +
 +    private val density = overlay.resources.displayMetrics.density
@@ -109,63 +136,101 @@ index 0000000..796dfd0
 +
 +    private val prefs get() = PreferenceManager.getDefaultSharedPreferences(CitraApplication.appContext)
 +
++    // ---------------------------------------------------------------- options
++    private var autoFire = prefs.getBoolean(PREF_AUTOFIRE, true)
++    private var dashAssist = prefs.getBoolean(PREF_DASH_ASSIST, true)
++    private var showAbInGame = prefs.getBoolean(PREF_SHOW_AB, false)
++    private var haptics = prefs.getBoolean(PREF_HAPTICS, true)
++    private var stickAlpha = prefs.getFloat(PREF_STICK_ALPHA, 0.6f)
++    private var buttonAlpha = prefs.getFloat(PREF_BUTTON_ALPHA, 0.8f)
++    private var stickSizeDp = prefs.getFloat(PREF_STICK_SIZE, 50f)
++    private var aimSensitivity = prefs.getFloat(PREF_AIM_SENS, 1.0f)
++
++    // ---------------------------------------------------------------- geometry
 +    private var viewW = 0
 +    private var viewH = 0
 +    private var laidOut = false
 +
-+    var menuMode = false
-+        private set
-+    private var autoFire = prefs.getBoolean(PREF_AUTOFIRE, true)
++    /** false = game view (top screen big), true = bottom screen big */
++    private var bottomBig = false
 +
-+    // Where the 3DS screens are drawn in the current mode
-+    private val bigRect = RectF()   // top screen (game) or bottom screen (menu)
-+    private val miniRect = RectF()  // bottom screen (game) or top screen (menu)
++    private val bigRect = RectF()
++    private val miniRect = RectF()
++    private val gameRect = RectF() // where the top screen sits in game view
++    private var miniW = 0f
++    private var miniH = 0f
 +
 +    private val buttons = listOf(
-+        KiuButton("MENU", ACTION_MENU),
-+        KiuButton("START", NativeLibrary.ButtonType.BUTTON_START),
-+        KiuButton("A", NativeLibrary.ButtonType.BUTTON_A),
-+        KiuButton("B", NativeLibrary.ButtonType.BUTTON_B),
-+        KiuButton("POWER", NativeLibrary.ButtonType.DPAD_DOWN),
-+        KiuButton("AF", ACTION_AUTOFIRE),
-+        KiuButton("FIRE", NativeLibrary.ButtonType.TRIGGER_L)
++        KiuButton("cog", "", ACTION_SETTINGS, Show.ALWAYS),
++        KiuButton("start", "START", NativeLibrary.ButtonType.BUTTON_START, Show.ALWAYS),
++        KiuButton("a", "A", NativeLibrary.ButtonType.BUTTON_A, Show.MENU),
++        KiuButton("b", "B", NativeLibrary.ButtonType.BUTTON_B, Show.MENU),
++        KiuButton("power", "POWER", NativeLibrary.ButtonType.DPAD_DOWN, Show.GAME),
++        KiuButton("fire", "FIRE", NativeLibrary.ButtonType.TRIGGER_L, Show.GAME),
++        KiuButton("qs", "SAVE", ACTION_QUICKSAVE, Show.ALWAYS),
++        KiuButton("ql", "LOAD", ACTION_QUICKLOAD, Show.ALWAYS)
 +    )
 +
-+    // Joystick state
++    // ---------------------------------------------------------------- input state
 +    private var stickId = -1
 +    private var stickCx = 0f
 +    private var stickCy = 0f
 +    private var stickX = 0f
 +    private var stickY = 0f
-+    private val stickRadius get() = dp(STICK_RADIUS_DP)
++    private var stickLowTime = 0L
++    private var dashLatched = false
++    private var dashPending = false
++    private val stickRadius get() = dp(stickSizeDp)
 +
-+    // Aim state
 +    private var aimId = -1
 +    private var aimX = 0f
 +    private var aimY = 0f
-+
-+    // Direct bottom-screen touch (mini screen in game mode, big screen in menu mode)
-+    private var directId = -1
-+
-+    // Number of sources currently holding L (aim auto-fire + FIRE button)
-+    private var lHolders = 0
++    private var aimDownX = 0f
++    private var aimDownY = 0f
++    private var aimStartNx = 0f
++    private var aimStartNy = 0f
 +    private var aimHoldsL = false
 +
++    /** Touch going straight to the 3DS touch screen (power strip or big bottom screen) */
++    private var directId = -1
++
++    /** Possible tap on the small screen that will swap the views */
++    private var swapTapId = -1
++    private var swapTapX = 0f
++    private var swapTapY = 0f
++
++    private var lHolders = 0
++
++    // ---------------------------------------------------------------- layout editor
++    private var editMode = false
++    private var selected: KiuButton? = null
++    private var dragId = -1
++    private var dragOffX = 0f
++    private var dragOffY = 0f
++    private val toolMinus = RectF()
++    private val toolPlus = RectF()
++    private val toolReset = RectF()
++    private val toolDone = RectF()
++    private val grid get() = dp(16f)
++
++    // ---------------------------------------------------------------- paints
++    private val serif = Typeface.create(Typeface.SERIF, Typeface.BOLD)
 +    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-+    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
 +        style = Paint.Style.STROKE
-+        strokeWidth = dp(2f)
-+        color = Color.argb(150, 255, 255, 255)
++        strokeCap = Paint.Cap.ROUND
++        strokeJoin = Paint.Join.ROUND
 +    }
 +    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-+        color = Color.argb(220, 255, 255, 255)
 +        textAlign = Paint.Align.CENTER
-+        textSize = dp(14f)
-+        isFakeBoldText = true
++        typeface = serif
 +    }
++    private val iconPath = Path()
 +
 +    val isActive: Boolean
 +        get() = laidOut && viewW > viewH && prefs.getBoolean(PREF_ENABLED, true)
++
++    // =================================================================== layout
 +
 +    fun onSizeChanged(width: Int, height: Int) {
 +        viewW = width
@@ -176,70 +241,48 @@ index 0000000..796dfd0
 +        }
 +        laidOut = true
 +        releaseAll()
-+        // Make sure the emulator isn't swapping screens on top of our own layout
 +        if (EmulationMenuSettings.swapScreens) {
 +            EmulationMenuSettings.swapScreens = false
 +            NativeLibrary.swapScreens(false, overlay.display?.rotation ?: 0)
 +        }
-+        layoutButtons()
++        computeGeometry()
++        loadButtonLayout()
 +        applyScreenLayout()
 +    }
 +
-+    private fun layoutButtons() {
++    private fun computeGeometry() {
 +        val w = viewW.toFloat()
 +        val h = viewH.toFloat()
-+        val gameW = min(w, h * 5f / 3f)
-+        val stripLeft = (w + gameW) / 2f
-+        var stripW = w - stripLeft
-+        val minStrip = dp(150f)
-+        val left = if (stripW < minStrip) w - minStrip else stripLeft
-+        stripW = w - left
-+
++        val gw = min(w, h * 5f / 3f)
++        val gh = gw * 3f / 5f
++        gameRect.set((w - gw) / 2f, (h - gh) / 2f, (w + gw) / 2f, (h + gh) / 2f)
 +        val pad = dp(6f)
-+        val colW = (stripW - pad * 3f) / 2f
-+        val btnH = min(colW * 0.8f, dp(64f))
-+        val col1 = left + pad
-+        val col2 = left + pad * 2f + colW
-+
-+        var y = pad + dp(8f)
-+        fun place(b: KiuButton, x: Float, top: Float, bw: Float, bh: Float) {
-+            b.rect.set(x, top, x + bw, top + bh)
-+        }
-+        place(buttons[0], col1, y, colW, btnH) // MENU
-+        place(buttons[1], col2, y, colW, btnH) // START
-+        y += btnH + pad
-+        place(buttons[2], col1, y, colW, btnH) // A
-+        place(buttons[3], col2, y, colW, btnH) // B
-+        y += btnH + pad
-+        place(buttons[4], col1, y, colW, btnH) // POWER
-+        place(buttons[5], col2, y, colW, btnH) // AF
-+
-+        // Big FIRE button at the bottom of the strip
-+        val fireH = min(stripW - pad * 2f, h * 0.28f)
-+        place(buttons[6], left + pad, h - pad - fireH - dp(8f), stripW - pad * 2f, fireH)
++        // The small bottom screen fits entirely inside the left black bar
++        miniW = max(gameRect.left - pad * 2f, dp(40f))
++        miniH = miniW * 0.75f
 +    }
 +
-+    /** Writes a custom layout to the emulator config and applies it. */
 +    private fun applyScreenLayout() {
 +        val w = viewW.toFloat()
 +        val h = viewH.toFloat()
 +        val pad = dp(6f)
-+
-+        if (!menuMode) {
-+            val gw = min(w, h * 5f / 3f)
-+            val gh = gw * 3f / 5f
-+            bigRect.set((w - gw) / 2f, (h - gh) / 2f, (w + gw) / 2f, (h + gh) / 2f)
-+            val strip = bigRect.left
-+            val mw = max(strip - pad * 2f, dp(120f))
-+            miniRect.set(pad, pad, pad + mw, pad + mw * 0.75f)
++        if (!bottomBig) {
++            bigRect.set(gameRect)
++            miniRect.set(pad, pad, pad + miniW, pad + miniH)
 +            writeLayout(top = bigRect, bottom = miniRect)
 +        } else {
 +            val bw = min(w, h * 4f / 3f)
 +            val bh = bw * 0.75f
 +            bigRect.set((w - bw) / 2f, (h - bh) / 2f, (w + bw) / 2f, (h + bh) / 2f)
-+            val strip = bigRect.left
-+            val mw = max(strip - pad * 2f, dp(120f))
-+            miniRect.set(pad, pad, pad + mw, pad + mw * 0.6f)
++            // Small top screen: same height as the small bottom screen, 5:3
++            var tw = miniH * 5f / 3f
++            var th = miniH
++            val maxW = bigRect.left - pad * 2f
++            if (tw > maxW) {
++                tw = max(maxW, dp(40f))
++                th = tw * 0.6f
++            }
++            miniRect.set(pad, pad, pad + tw, pad + th)
 +            writeLayout(top = miniRect, bottom = bigRect)
 +        }
 +    }
@@ -249,20 +292,19 @@ index 0000000..796dfd0
 +            ?: return
 +        val values = listOf(
 +            IntSetting.SCREEN_LAYOUT to LAYOUT_CUSTOM,
-+            IntSetting.LANDSCAPE_TOP_X to top.left.toInt(),
-+            IntSetting.LANDSCAPE_TOP_Y to top.top.toInt(),
-+            IntSetting.LANDSCAPE_TOP_WIDTH to top.width().toInt(),
-+            IntSetting.LANDSCAPE_TOP_HEIGHT to top.height().toInt(),
-+            IntSetting.LANDSCAPE_BOTTOM_X to bottom.left.toInt(),
-+            IntSetting.LANDSCAPE_BOTTOM_Y to bottom.top.toInt(),
-+            IntSetting.LANDSCAPE_BOTTOM_WIDTH to bottom.width().toInt(),
-+            IntSetting.LANDSCAPE_BOTTOM_HEIGHT to bottom.height().toInt()
++            IntSetting.LANDSCAPE_TOP_X to top.left.roundToInt(),
++            IntSetting.LANDSCAPE_TOP_Y to top.top.roundToInt(),
++            IntSetting.LANDSCAPE_TOP_WIDTH to top.width().roundToInt(),
++            IntSetting.LANDSCAPE_TOP_HEIGHT to top.height().roundToInt(),
++            IntSetting.LANDSCAPE_BOTTOM_X to bottom.left.roundToInt(),
++            IntSetting.LANDSCAPE_BOTTOM_Y to bottom.top.roundToInt(),
++            IntSetting.LANDSCAPE_BOTTOM_WIDTH to bottom.width().roundToInt(),
++            IntSetting.LANDSCAPE_BOTTOM_HEIGHT to bottom.height().roundToInt()
 +        )
 +        for ((setting, value) in values) {
 +            setting.int = value
 +            settings.saveSetting(setting, SettingsFile.FILE_NAME_CONFIG)
 +        }
-+        // The emulator's own screen swap must stay off; KIU mode positions the screens itself
 +        if (BooleanSetting.SWAP_SCREEN.boolean) {
 +            BooleanSetting.SWAP_SCREEN.boolean = false
 +            settings.saveSetting(BooleanSetting.SWAP_SCREEN, SettingsFile.FILE_NAME_CONFIG)
@@ -271,9 +313,95 @@ index 0000000..796dfd0
 +        NativeLibrary.updateFramebuffer(false)
 +    }
 +
-+    // ---------------------------------------------------------------- touch
++    /** Default button positions: everything inside the black bars. */
++    private fun setDefaultLayout() {
++        val w = viewW.toFloat()
++        val h = viewH.toFloat()
++        val pad = dp(8f)
++        val stripL = gameRect.left
++        val rightX = gameRect.right
++        val stripR = w - rightX
++
++        fun set(id: String, cx: Float, cy: Float, size: Float) {
++            val b = buttons.first { it.id == id }
++            b.cx = cx
++            b.cy = cy
++            b.size = size
++        }
++
++        // Right bar: [cog][start] / [A][B] / POWER / FIRE
++        val small = min(dp(48f), (stripR - pad * 3f) / 2f)
++        val colA = rightX + pad + small / 2f
++        val colB = w - pad - small / 2f
++        val row1 = pad + small / 2f
++        val row2 = row1 + small + pad
++        set("cog", colA, row1, small * 0.85f)
++        set("start", colB, row1, small)
++        set("a", colB, row2, small)
++        set("b", colA, row2 + small * 0.55f, small)
++
++        val fire = min(dp(100f), stripR - pad * 2f)
++        val fireCy = h - pad - fire / 2f
++        set("fire", rightX + stripR / 2f, fireCy, fire)
++        val power = min(dp(64f), stripR - pad * 2f)
++        set("power", rightX + stripR / 2f, fireCy - fire / 2f - pad * 1.5f - power / 2f, power)
++
++        // Left bar: quick save / load under the small screen
++        val q = min(dp(46f), (stripL - pad * 3f) / 2f)
++        val qy = pad + miniH + pad * 1.5f + q / 2f
++        set("qs", pad + q / 2f + (stripL - pad * 3f - q * 2f) / 4f, qy, q)
++        set("ql", stripL - pad - q / 2f - (stripL - pad * 3f - q * 2f) / 4f, qy, q)
++    }
++
++    private fun loadButtonLayout() {
++        setDefaultLayout()
++        val h = viewH.toFloat()
++        val w = viewW.toFloat()
++        for (b in buttons) {
++            val saved = prefs.getString(PREF_BTN_PREFIX + b.id, null) ?: continue
++            val parts = saved.split(",")
++            if (parts.size != 3) continue
++            val fx = parts[0].toFloatOrNull() ?: continue
++            val fy = parts[1].toFloatOrNull() ?: continue
++            val fs = parts[2].toFloatOrNull() ?: continue
++            b.cx = fx * w
++            b.cy = fy * h
++            b.size = fs * h
++        }
++    }
++
++    private fun saveButtonLayout() {
++        val e = prefs.edit()
++        for (b in buttons) {
++            e.putString(
++                PREF_BTN_PREFIX + b.id,
++                "${b.cx / viewW},${b.cy / viewH},${b.size / viewH}"
++            )
++        }
++        e.apply()
++    }
++
++    private fun resetButtonLayout() {
++        val e = prefs.edit()
++        for (b in buttons) e.remove(PREF_BTN_PREFIX + b.id)
++        e.apply()
++        setDefaultLayout()
++    }
++
++    private fun isVisible(b: KiuButton): Boolean = when (b.show) {
++        Show.ALWAYS -> true
++        Show.GAME -> !bottomBig
++        Show.MENU -> bottomBig || showAbInGame
++    }
++
++    // =================================================================== touch
 +
 +    fun onTouch(event: MotionEvent): Boolean {
++        if (editMode) {
++            onEditTouch(event)
++            overlay.invalidate()
++            return true
++        }
 +        when (event.actionMasked) {
 +            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
 +                val i = event.actionIndex
@@ -287,7 +415,8 @@ index 0000000..796dfd0
 +            }
 +
 +            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
-+                onUp(event.getPointerId(event.actionIndex))
++                val i = event.actionIndex
++                onUp(event.getPointerId(i), event.getX(i), event.getY(i))
 +            }
 +
 +            MotionEvent.ACTION_CANCEL -> releaseAll()
@@ -297,35 +426,36 @@ index 0000000..796dfd0
 +    }
 +
 +    private fun onDown(id: Int, x: Float, y: Float) {
-+        // Buttons first (slightly enlarged hit areas)
-+        val slop = dp(6f)
++        val slop = dp(4f)
 +        for (b in buttons) {
-+            if (b.pointerId == -1 &&
-+                x >= b.rect.left - slop && x <= b.rect.right + slop &&
-+                y >= b.rect.top - slop && y <= b.rect.bottom + slop
-+            ) {
++            if (isVisible(b) && b.pointerId == -1 && b.contains(x, y, slop)) {
 +                pressButton(b, id)
 +                return
 +            }
 +        }
 +
-+        if (menuMode) {
-+            // Menu mode: big screen is the touch screen
-+            if (directId == -1 && bigRect.contains(x, y)) {
-+                directId = id
-+                NativeLibrary.onTouchEvent(x, y, true)
++        if (miniRect.contains(x, y)) {
++            // Bottom strip of the small bottom screen passes straight to the game (powers)
++            val powerStrip = !bottomBig && y > miniRect.bottom - miniRect.height() * POWER_STRIP
++            if (powerStrip) {
++                if (directId == -1) {
++                    directId = id
++                    if (aimId != -1) NativeLibrary.onTouchEvent(0f, 0f, false)
++                    NativeLibrary.onTouchEvent(x, y, true)
++                }
++            } else if (swapTapId == -1) {
++                swapTapId = id
++                swapTapX = x
++                swapTapY = y
 +            }
 +            return
 +        }
 +
-+        // Game mode
-+        if (directId == -1 && miniRect.contains(x, y)) {
-+            directId = id
-+            if (aimId != -1) {
-+                // The 3DS has a single touch point: the tap on the mini screen wins
-+                NativeLibrary.onTouchEvent(0f, 0f, false)
++        if (bottomBig) {
++            if (directId == -1 && bigRect.contains(x, y)) {
++                directId = id
++                NativeLibrary.onTouchEvent(x, y, true)
 +            }
-+            NativeLibrary.onTouchEvent(x, y, true)
 +            return
 +        }
 +
@@ -336,53 +466,33 @@ index 0000000..796dfd0
 +                stickCy = y
 +                stickX = 0f
 +                stickY = 0f
-+                sendStick()
++                stickLowTime = SystemClock.uptimeMillis()
++                dashLatched = false
++                sendStick(0f, 0f)
 +            }
-+        } else {
-+            if (aimId == -1) {
-+                aimId = id
-+                aimX = x
-+                aimY = y
-+                if (directId == -1) {
-+                    val (fx, fy) = aimToFramebuffer(x, y)
-+                    NativeLibrary.onTouchEvent(fx, fy, true)
-+                }
-+                if (autoFire) {
-+                    aimHoldsL = true
-+                    holdL(true)
-+                }
++        } else if (aimId == -1) {
++            aimId = id
++            aimX = x
++            aimY = y
++            aimDownX = x
++            aimDownY = y
++            val zoneLeft = viewW / 2f
++            aimStartNx = ((x - zoneLeft) / (viewW - zoneLeft)).coerceIn(0f, 1f)
++            aimStartNy = (y / viewH).coerceIn(0f, 1f)
++            if (directId == -1) {
++                val (fx, fy) = aimToFramebuffer(x, y)
++                NativeLibrary.onTouchEvent(fx, fy, true)
++            }
++            if (autoFire) {
++                aimHoldsL = true
++                holdL(true)
 +            }
 +        }
 +    }
 +
 +    private fun onMove(id: Int, x: Float, y: Float) {
 +        when (id) {
-+            stickId -> {
-+                var dx = x - stickCx
-+                var dy = y - stickCy
-+                val r = stickRadius
-+                val dist = sqrt(dx * dx + dy * dy)
-+                // Let the stick base follow the thumb if it drifts far away
-+                val followAt = r * 1.4f
-+                if (dist > followAt) {
-+                    val excess = (dist - followAt) / dist
-+                    stickCx += dx * excess
-+                    stickCy += dy * excess
-+                    dx = x - stickCx
-+                    dy = y - stickCy
-+                }
-+                var nx = dx / r
-+                var ny = dy / r
-+                val len = sqrt(nx * nx + ny * ny)
-+                if (len > 1f) {
-+                    nx /= len
-+                    ny /= len
-+                }
-+                stickX = nx
-+                stickY = ny
-+                sendStick()
-+            }
-+
++            stickId -> moveStick(x, y)
 +            aimId -> {
 +                aimX = x
 +                aimY = y
@@ -396,7 +506,7 @@ index 0000000..796dfd0
 +        }
 +    }
 +
-+    private fun onUp(id: Int) {
++    private fun onUp(id: Int, x: Float, y: Float) {
 +        for (b in buttons) {
 +            if (b.pointerId == id) {
 +                releaseButton(b)
@@ -408,7 +518,8 @@ index 0000000..796dfd0
 +                stickId = -1
 +                stickX = 0f
 +                stickY = 0f
-+                sendStick()
++                dashLatched = false
++                sendStick(0f, 0f)
 +            }
 +
 +            aimId -> {
@@ -420,38 +531,95 @@ index 0000000..796dfd0
 +            directId -> {
 +                directId = -1
 +                NativeLibrary.onTouchEvent(0f, 0f, false)
-+                if (!menuMode && aimId != -1) {
-+                    // Hand the touch point back to the aim pad
++                if (!bottomBig && aimId != -1) {
 +                    val (fx, fy) = aimToFramebuffer(aimX, aimY)
 +                    NativeLibrary.onTouchEvent(fx, fy, true)
 +                }
 +            }
++
++            swapTapId -> {
++                swapTapId = -1
++                val moved = abs(x - swapTapX) + abs(y - swapTapY)
++                if (moved < dp(24f) && miniRect.contains(x, y)) toggleView()
++            }
 +        }
 +    }
 +
-+    /** Maps a touch on the right half of the phone to a point on the (small) bottom screen. */
++    private fun moveStick(x: Float, y: Float) {
++        var dx = x - stickCx
++        var dy = y - stickCy
++        val r = stickRadius
++        val dist = sqrt(dx * dx + dy * dy)
++        val followAt = r * 1.4f
++        if (dist > followAt) {
++            val excess = (dist - followAt) / dist
++            stickCx += dx * excess
++            stickCy += dy * excess
++            dx = x - stickCx
++            dy = y - stickCy
++        }
++        var nx = dx / r
++        var ny = dy / r
++        val len = sqrt(nx * nx + ny * ny)
++        if (len > 1f) {
++            nx /= len
++            ny /= len
++        }
++        stickX = nx
++        stickY = ny
++        val mag = min(len, 1f)
++        val now = SystemClock.uptimeMillis()
++
++        if (mag < 0.3f) {
++            stickLowTime = now
++            dashLatched = false
++        }
++
++        if (dashAssist && !dashLatched && mag >= 0.7f && now - stickLowTime < DASH_WINDOW_MS) {
++            // The game only dashes on a fast flick from centre to edge. Recreate that flick:
++            // a moment of neutral, then full deflection.
++            dashLatched = true
++            dashPending = true
++            sendStick(0f, 0f)
++            overlay.postDelayed({
++                dashPending = false
++                if (stickId != -1) sendStickNormalised()
++            }, DASH_NEUTRAL_MS)
++            return
++        }
++        if (dashPending) return
++        sendStickNormalised()
++    }
++
++    private fun sendStickNormalised() {
++        if (dashLatched) {
++            // Keep the stick fully pushed while dashing
++            val len = sqrt(stickX * stickX + stickY * stickY)
++            if (len > 0.01f) {
++                sendStick(stickX / len, stickY / len)
++                return
++            }
++        }
++        sendStick(stickX, stickY)
++    }
++
++    /** Maps a touch on the right half to a point on the small bottom screen. */
 +    private fun aimToFramebuffer(x: Float, y: Float): Pair<Float, Float> {
 +        val zoneLeft = viewW / 2f
-+        val nx = ((x - zoneLeft) / (viewW - zoneLeft)).coerceIn(0f, 1f)
-+        val ny = (y / viewH).coerceIn(0f, 1f)
++        val zoneW = viewW - zoneLeft
++        val nx = (aimStartNx + (x - aimDownX) / zoneW * aimSensitivity).coerceIn(0f, 1f)
++        val ny = (aimStartNy + (y - aimDownY) / viewH * aimSensitivity).coerceIn(0f, 1f)
 +        val fx = miniRect.left + 1f + nx * (miniRect.width() - 2f)
 +        val fy = miniRect.top + 1f + ny * (miniRect.height() - 2f)
 +        return Pair(fx, fy)
 +    }
 +
-+    private fun releaseAimFire() {
-+        if (aimHoldsL) {
-+            aimHoldsL = false
-+            holdL(false)
-+        }
-+    }
-+
-+    private fun sendStick() {
++    private fun sendStick(x: Float, y: Float) {
 +        NativeLibrary.onGamePadMoveEvent(
 +            NativeLibrary.TOUCHSCREEN_DEVICE,
 +            NativeLibrary.ButtonType.STICK_LEFT,
-+            stickX,
-+            stickY
++            x,
++            y
 +        )
 +    }
 +
@@ -465,6 +633,13 @@ index 0000000..796dfd0
 +        }
 +    }
 +
++    private fun releaseAimFire() {
++        if (aimHoldsL) {
++            aimHoldsL = false
++            holdL(false)
++        }
++    }
++
 +    private fun sendButton(button: Int, press: Boolean) {
 +        NativeLibrary.onGamePadEvent(
 +            NativeLibrary.TOUCHSCREEN_DEVICE,
@@ -473,15 +648,23 @@ index 0000000..796dfd0
 +        )
 +    }
 +
++    private fun buzz() {
++        if (haptics) overlay.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
++    }
++
++    private fun toast(text: String) {
++        Toast.makeText(CitraApplication.appContext, text, Toast.LENGTH_SHORT).show()
++    }
++
 +    private fun pressButton(b: KiuButton, id: Int) {
 +        b.pointerId = id
-+        overlay.hapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
++        b.downTime = SystemClock.uptimeMillis()
++        buzz()
 +        when (b.action) {
-+            ACTION_MENU -> toggleMenuMode()
-+            ACTION_AUTOFIRE -> {
-+                releaseAimFire()
-+                autoFire = !autoFire
-+                prefs.edit().putBoolean(PREF_AUTOFIRE, autoFire).apply()
++            ACTION_SETTINGS, ACTION_QUICKLOAD -> {}
++            ACTION_QUICKSAVE -> {
++                NativeLibrary.saveState(NativeLibrary.QUICKSAVE_SLOT)
++                toast("Quick saved")
 +            }
 +
 +            NativeLibrary.ButtonType.TRIGGER_L -> holdL(true)
@@ -491,46 +674,53 @@ index 0000000..796dfd0
 +
 +    private fun releaseButton(b: KiuButton) {
 +        b.pointerId = -1
++        val held = SystemClock.uptimeMillis() - b.downTime
 +        when (b.action) {
-+            ACTION_MENU, ACTION_AUTOFIRE -> {}
++            ACTION_QUICKSAVE -> {}
++            ACTION_SETTINGS -> openSettings()
++            ACTION_QUICKLOAD -> {
++                if (held >= QUICKLOAD_HOLD_MS) {
++                    val loaded = NativeLibrary.loadStateIfAvailable(NativeLibrary.QUICKSAVE_SLOT)
++                    toast(if (loaded) "Quick loaded" else "No quick save yet")
++                } else {
++                    toast("Hold LOAD to load your quick save")
++                }
++            }
++
 +            NativeLibrary.ButtonType.TRIGGER_L -> holdL(false)
 +            else -> sendButton(b.action, false)
 +        }
 +    }
 +
-+    private fun toggleMenuMode() {
-+        // Let go of everything except the MENU button itself
-+        if (stickId != -1) {
-+            stickId = -1
-+            stickX = 0f
-+            stickY = 0f
-+            sendStick()
-+        }
-+        if (aimId != -1 || directId != -1) {
-+            NativeLibrary.onTouchEvent(0f, 0f, false)
-+        }
-+        releaseAimFire()
-+        aimId = -1
-+        directId = -1
-+        menuMode = !menuMode
++    private fun toggleView() {
++        releaseAll()
++        bottomBig = !bottomBig
++        buzz()
 +        applyScreenLayout()
 +    }
 +
 +    private fun releaseAll() {
 +        for (b in buttons) {
-+            if (b.pressed) releaseButton(b)
++            if (b.pressed) {
++                b.pointerId = -1
++                if (b.action >= 0 && b.action != NativeLibrary.ButtonType.TRIGGER_L) {
++                    sendButton(b.action, false)
++                }
++            }
 +        }
 +        if (stickId != -1) {
 +            stickId = -1
 +            stickX = 0f
 +            stickY = 0f
-+            sendStick()
++            sendStick(0f, 0f)
 +        }
++        dashLatched = false
 +        if (aimId != -1 || directId != -1) {
 +            NativeLibrary.onTouchEvent(0f, 0f, false)
 +        }
 +        aimId = -1
 +        directId = -1
++        swapTapId = -1
 +        aimHoldsL = false
 +        if (lHolders > 0) {
 +            lHolders = 0
@@ -538,67 +728,400 @@ index 0000000..796dfd0
 +        }
 +    }
 +
-+    // ---------------------------------------------------------------- drawing
++    // =================================================================== settings
 +
-+    fun draw(canvas: Canvas) {
-+        // Frame around the small screen
-+        canvas.drawRoundRect(miniRect, dp(4f), dp(4f), strokePaint)
++    private fun openSettings() {
++        releaseAll()
++        val ctx: Context = overlay.context
++        NativeLibrary.pauseEmulation()
 +
-+        for (b in buttons) {
-+            val label = if (b.action == ACTION_AUTOFIRE) {
-+                if (autoFire) "AF ON" else "AF OFF"
-+            } else if (b.action == ACTION_MENU) {
-+                if (menuMode) "GAME" else "MENU"
-+            } else {
-+                b.label
-+            }
-+            val active = b.pressed || (b.action == ACTION_AUTOFIRE && autoFire)
-+            fillPaint.color = if (active) {
-+                Color.argb(150, 120, 170, 255)
-+            } else {
-+                Color.argb(70, 255, 255, 255)
-+            }
-+            val r = dp(12f)
-+            canvas.drawRoundRect(b.rect, r, r, fillPaint)
-+            canvas.drawRoundRect(b.rect, r, r, strokePaint)
-+            canvas.drawText(
-+                label,
-+                b.rect.centerX(),
-+                b.rect.centerY() - (textPaint.descent() + textPaint.ascent()) / 2f,
-+                textPaint
-+            )
++        val pad = dp(20f).toInt()
++        val column = LinearLayout(ctx).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(pad, pad / 2, pad, 0)
 +        }
 +
-+        if (menuMode) return
-+
-+        // Joystick
-+        val r = stickRadius
-+        if (stickId != -1) {
-+            fillPaint.color = Color.argb(50, 255, 255, 255)
-+            canvas.drawCircle(stickCx, stickCy, r, fillPaint)
-+            canvas.drawCircle(stickCx, stickCy, r, strokePaint)
-+            fillPaint.color = Color.argb(140, 255, 255, 255)
-+            canvas.drawCircle(stickCx + stickX * r, stickCy + stickY * r, r * 0.45f, fillPaint)
-+        } else {
-+            // Faint hint of where the stick usually lives
-+            strokePaint.alpha = 50
-+            canvas.drawCircle(bigRect.left + r * 1.3f, viewH - r * 1.6f, r, strokePaint)
-+            strokePaint.alpha = 150
++        fun note(text: String) {
++            column.addView(TextView(ctx).apply {
++                this.text = text
++                alpha = 0.7f
++                textSize = 12f
++                setPadding(0, 0, 0, pad / 2)
++            })
 +        }
 +
-+        // Aim touch marker
-+        if (aimId != -1) {
-+            canvas.drawCircle(aimX, aimY, dp(22f), strokePaint)
++        fun toggle(title: String, value: Boolean, onChange: (Boolean) -> Unit) {
++            column.addView(MaterialSwitch(ctx).apply {
++                text = title
++                isChecked = value
++                setOnCheckedChangeListener { _, checked -> onChange(checked) }
++            })
++        }
++
++        fun slider(
++            title: String,
++            from: Float,
++            to: Float,
++            step: Float,
++            value: Float,
++            onChange: (Float) -> Unit
++        ) {
++            column.addView(TextView(ctx).apply {
++                text = title
++                setPadding(0, pad / 2, 0, 0)
++            })
++            val steps = ((value - from) / step).roundToInt()
++            val snapped = (from + steps * step).coerceIn(from, to)
++            column.addView(Slider(ctx).apply {
++                valueFrom = from
++                valueTo = to
++                stepSize = step
++                this.value = snapped
++                addOnChangeListener { _, v, _ -> onChange(v) }
++            })
++        }
++
++        toggle("Auto-fire while aiming", autoFire) {
++            autoFire = it
++            prefs.edit().putBoolean(PREF_AUTOFIRE, it).apply()
++        }
++        note("On: Pit fires whenever your right thumb is on the aim area. Off: fire only with the FIRE button.")
++
++        toggle("Dash assist", dashAssist) {
++            dashAssist = it
++            prefs.edit().putBoolean(PREF_DASH_ASSIST, it).apply()
++        }
++        note("Pushing the joystick out quickly turns into a sprint (or a dodge if you let go).")
++
++        toggle("Show A / B during battles", showAbInGame) {
++            showAbInGame = it
++            prefs.edit().putBoolean(PREF_SHOW_AB, it).apply()
++        }
++
++        toggle("Vibration", haptics) {
++            haptics = it
++            prefs.edit().putBoolean(PREF_HAPTICS, it).apply()
++        }
++
++        slider("Joystick visibility (0 = invisible)", 0f, 100f, 5f, stickAlpha * 100f) {
++            stickAlpha = it / 100f
++            prefs.edit().putFloat(PREF_STICK_ALPHA, stickAlpha).apply()
++        }
++        slider("Joystick size", 30f, 90f, 5f, stickSizeDp) {
++            stickSizeDp = it
++            prefs.edit().putFloat(PREF_STICK_SIZE, it).apply()
++        }
++        slider("Button visibility", 10f, 100f, 5f, buttonAlpha * 100f) {
++            buttonAlpha = it / 100f
++            prefs.edit().putFloat(PREF_BUTTON_ALPHA, buttonAlpha).apply()
++        }
++        slider("Aim sensitivity (%)", 50f, 250f, 10f, aimSensitivity * 100f) {
++            aimSensitivity = it / 100f
++            prefs.edit().putFloat(PREF_AIM_SENS, aimSensitivity).apply()
++        }
++
++        val scroll = ScrollView(ctx).apply { addView(column) }
++        var startEditing = false
++        MaterialAlertDialogBuilder(ctx)
++            .setTitle("Uprising controls")
++            .setView(scroll)
++            .setPositiveButton("Done", null)
++            .setNeutralButton("Edit button layout") { _, _ -> startEditing = true }
++            .setOnDismissListener {
++                if (startEditing) {
++                    editMode = true
++                    selected = null
++                } else {
++                    NativeLibrary.unPauseEmulation()
++                }
++                overlay.invalidate()
++            }
++            .show()
++    }
++
++    // =================================================================== layout editor
++
++    private fun snap(v: Float): Float = (v / grid).roundToInt() * grid
++
++    private fun onEditTouch(event: MotionEvent) {
++        val i = event.actionIndex
++        val id = event.getPointerId(i)
++        when (event.actionMasked) {
++            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
++                val x = event.getX(i)
++                val y = event.getY(i)
++                val sel = selected
++                when {
++                    toolDone.contains(x, y) -> {
++                        editMode = false
++                        selected = null
++                        saveButtonLayout()
++                        NativeLibrary.unPauseEmulation()
++                    }
++
++                    toolReset.contains(x, y) -> {
++                        resetButtonLayout()
++                        selected = null
++                    }
++
++                    toolMinus.contains(x, y) && sel != null -> resizeSelected(-dp(4f))
++                    toolPlus.contains(x, y) && sel != null -> resizeSelected(dp(4f))
++                    else -> {
++                        val hit = buttons.lastOrNull { it.contains(x, y, dp(4f)) }
++                        selected = hit
++                        if (hit != null && dragId == -1) {
++                            dragId = id
++                            dragOffX = x - hit.cx
++                            dragOffY = y - hit.cy
++                        }
++                    }
++                }
++            }
++
++            MotionEvent.ACTION_MOVE -> {
++                val sel = selected ?: return
++                val idx = event.findPointerIndex(dragId)
++                if (idx < 0) return
++                val r = sel.size / 2f
++                sel.cx = snap(event.getX(idx) - dragOffX).coerceIn(r, viewW - r)
++                sel.cy = snap(event.getY(idx) - dragOffY).coerceIn(r, viewH - r)
++            }
++
++            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
++                if (id == dragId) dragId = -1
++            }
++
++            MotionEvent.ACTION_CANCEL -> dragId = -1
 +        }
 +    }
 +
++    private fun resizeSelected(delta: Float) {
++        val sel = selected ?: return
++        sel.size = (sel.size + delta).coerceIn(dp(32f), dp(160f))
++    }
++
++    // =================================================================== drawing
++
++    private fun withAlpha(color: Int, a: Float): Int =
++        Color.argb((Color.alpha(color) * a).toInt().coerceIn(0, 255), Color.red(color), Color.green(color), Color.blue(color))
++
++    fun draw(canvas: Canvas) {
++        if (editMode) {
++            drawEditor(canvas)
++            return
++        }
++
++        drawMiniFrame(canvas)
++
++        for (b in buttons) {
++            if (isVisible(b)) drawButton(canvas, b, buttonAlpha)
++        }
++
++        if (bottomBig) return
++
++        // Joystick
++        if (stickAlpha > 0f) {
++            val r = stickRadius
++            if (stickId != -1) {
++                linePaint.strokeWidth = dp(2.5f)
++                linePaint.color = withAlpha(GOLD, stickAlpha)
++                fillPaint.color = withAlpha(NAVY_SOFT, stickAlpha)
++                canvas.drawCircle(stickCx, stickCy, r, fillPaint)
++                canvas.drawCircle(stickCx, stickCy, r, linePaint)
++                linePaint.strokeWidth = dp(1f)
++                canvas.drawCircle(stickCx, stickCy, r - dp(5f), linePaint)
++                val kx = stickCx + stickX * r
++                val ky = stickCy + stickY * r
++                fillPaint.color = withAlpha(IVORY, stickAlpha)
++                canvas.drawCircle(kx, ky, r * 0.42f, fillPaint)
++                linePaint.strokeWidth = dp(2f)
++                canvas.drawCircle(kx, ky, r * 0.42f, linePaint)
++                fillPaint.color = withAlpha(if (dashLatched) SKY else NAVY, stickAlpha)
++                canvas.drawCircle(kx, ky, r * 0.16f, fillPaint)
++            } else {
++                linePaint.strokeWidth = dp(1.5f)
++                linePaint.color = withAlpha(GOLD, stickAlpha * 0.35f)
++                canvas.drawCircle(gameRect.left + r * 1.6f, viewH - r * 1.8f, r, linePaint)
++            }
++        }
++
++        if (aimId != -1) {
++            linePaint.strokeWidth = dp(2f)
++            linePaint.color = withAlpha(GOLD, 0.5f)
++            canvas.drawCircle(aimX, aimY, dp(24f), linePaint)
++        }
++    }
++
++    private fun drawMiniFrame(canvas: Canvas) {
++        val r = dp(4f)
++        linePaint.color = GOLD
++        linePaint.strokeWidth = dp(2f)
++        canvas.drawRoundRect(miniRect, r, r, linePaint)
++        if (!bottomBig) {
++            // Mark the power strip
++            val y = miniRect.bottom - miniRect.height() * POWER_STRIP
++            linePaint.strokeWidth = dp(1f)
++            linePaint.color = withAlpha(GOLD, 0.5f)
++            canvas.drawLine(miniRect.left + r, y, miniRect.right - r, y, linePaint)
++        }
++    }
++
++    private fun drawButton(canvas: Canvas, b: KiuButton, alpha: Float, highlight: Boolean = false) {
++        val r = b.size / 2f
++        fillPaint.color = withAlpha(if (b.pressed) SKY else NAVY, alpha)
++        canvas.drawCircle(b.cx, b.cy, r, fillPaint)
++        linePaint.color = withAlpha(if (highlight) SKY_LIGHT else GOLD, alpha)
++        linePaint.strokeWidth = if (highlight) dp(4f) else dp(2.5f)
++        canvas.drawCircle(b.cx, b.cy, r - dp(1f), linePaint)
++        linePaint.strokeWidth = dp(1f)
++        linePaint.color = withAlpha(GOLD, alpha * 0.6f)
++        canvas.drawCircle(b.cx, b.cy, r - dp(5f), linePaint)
++
++        val ink = withAlpha(IVORY, alpha)
++        when (b.action) {
++            ACTION_SETTINGS -> drawCog(canvas, b.cx, b.cy, r * 0.5f, ink)
++            NativeLibrary.ButtonType.TRIGGER_L -> {
++                drawArrow(canvas, b.cx, b.cy - r * 0.12f, r * 0.5f, ink)
++                drawLabel(canvas, b.label, b.cx, b.cy + r * 0.48f, r * 0.26f, ink)
++            }
++
++            NativeLibrary.ButtonType.DPAD_DOWN -> {
++                drawBolt(canvas, b.cx, b.cy - r * 0.12f, r * 0.42f, ink)
++                drawLabel(canvas, b.label, b.cx, b.cy + r * 0.5f, r * 0.24f, ink)
++            }
++
++            ACTION_QUICKSAVE, ACTION_QUICKLOAD, NativeLibrary.ButtonType.BUTTON_START ->
++                drawLabel(canvas, b.label, b.cx, b.cy, r * 0.34f, ink)
++
++            else -> drawLabel(canvas, b.label, b.cx, b.cy, r * 0.62f, ink)
++        }
++    }
++
++    private fun drawLabel(canvas: Canvas, text: String, cx: Float, cy: Float, size: Float, color: Int) {
++        textPaint.textSize = size
++        textPaint.color = color
++        canvas.drawText(text, cx, cy - (textPaint.descent() + textPaint.ascent()) / 2f, textPaint)
++    }
++
++    /** Pit's arrow: shaft, head and fletching pointing up-right. */
++    private fun drawArrow(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
++        linePaint.color = color
++        linePaint.strokeWidth = s * 0.16f
++        canvas.drawLine(cx - s * 0.7f, cy + s * 0.7f, cx + s * 0.6f, cy - s * 0.6f, linePaint)
++        iconPath.reset()
++        iconPath.moveTo(cx + s * 0.85f, cy - s * 0.85f)
++        iconPath.lineTo(cx + s * 0.25f, cy - s * 0.55f)
++        iconPath.lineTo(cx + s * 0.55f, cy - s * 0.25f)
++        iconPath.close()
++        fillPaint.color = color
++        canvas.drawPath(iconPath, fillPaint)
++        canvas.drawLine(cx - s * 0.7f, cy + s * 0.7f, cx - s * 0.75f, cy + s * 0.3f, linePaint)
++        canvas.drawLine(cx - s * 0.7f, cy + s * 0.7f, cx - s * 0.3f, cy + s * 0.75f, linePaint)
++    }
++
++    private fun drawBolt(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
++        iconPath.reset()
++        iconPath.moveTo(cx + s * 0.15f, cy - s)
++        iconPath.lineTo(cx - s * 0.55f, cy + s * 0.15f)
++        iconPath.lineTo(cx - s * 0.05f, cy + s * 0.15f)
++        iconPath.lineTo(cx - s * 0.2f, cy + s)
++        iconPath.lineTo(cx + s * 0.55f, cy - s * 0.2f)
++        iconPath.lineTo(cx + s * 0.05f, cy - s * 0.2f)
++        iconPath.close()
++        fillPaint.color = color
++        canvas.drawPath(iconPath, fillPaint)
++    }
++
++    private fun drawCog(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
++        linePaint.color = color
++        linePaint.strokeWidth = s * 0.3f
++        canvas.drawCircle(cx, cy, s * 0.55f, linePaint)
++        linePaint.strokeWidth = s * 0.28f
++        for (k in 0 until 8) {
++            val a = Math.toRadians(k * 45.0)
++            val c = Math.cos(a).toFloat()
++            val sn = Math.sin(a).toFloat()
++            canvas.drawLine(cx + c * s * 0.7f, cy + sn * s * 0.7f, cx + c * s, cy + sn * s, linePaint)
++        }
++    }
++
++    private fun drawEditor(canvas: Canvas) {
++        canvas.drawColor(Color.argb(110, 0, 0, 0))
++
++        // Snap grid
++        linePaint.strokeWidth = dp(0.75f)
++        linePaint.color = withAlpha(GOLD, 0.18f)
++        var gx = 0f
++        while (gx <= viewW) {
++            canvas.drawLine(gx, 0f, gx, viewH.toFloat(), linePaint)
++            gx += grid
++        }
++        var gy = 0f
++        while (gy <= viewH) {
++            canvas.drawLine(0f, gy, viewW.toFloat(), gy, linePaint)
++            gy += grid
++        }
++
++        drawMiniFrame(canvas)
++        for (b in buttons) drawButton(canvas, b, 1f, highlight = b === selected)
++
++        // Toolbar
++        val bw = dp(76f)
++        val bh = dp(40f)
++        val gap = dp(10f)
++        val total = bw * 4 + gap * 3
++        var x = (viewW - total) / 2f
++        val y = gameRect.top + dp(10f)
++        for ((rect, label) in listOf(
++            toolMinus to "−", toolPlus to "+", toolReset to "RESET", toolDone to "DONE"
++        )) {
++            rect.set(x, y, x + bw, y + bh)
++            val enabled = selected != null || rect === toolReset || rect === toolDone
++            fillPaint.color = if (rect === toolDone) SKY else NAVY
++            canvas.drawRoundRect(rect, bh / 2f, bh / 2f, fillPaint)
++            linePaint.strokeWidth = dp(2f)
++            linePaint.color = GOLD
++            canvas.drawRoundRect(rect, bh / 2f, bh / 2f, linePaint)
++            drawLabel(canvas, label, rect.centerX(), rect.centerY(), dp(16f), withAlpha(IVORY, if (enabled) 1f else 0.35f))
++            x += bw + gap
++        }
++        drawLabel(
++            canvas,
++            if (selected == null) "Tap a button to select it, drag to move" else "Drag to move · − / + to resize",
++            viewW / 2f,
++            y + bh + dp(22f),
++            dp(13f),
++            IVORY
++        )
++    }
++
 +    companion object {
-+        private const val ACTION_MENU = -1001
-+        private const val ACTION_AUTOFIRE = -1002
++        private const val ACTION_SETTINGS = -1001
++        private const val ACTION_QUICKSAVE = -1003
++        private const val ACTION_QUICKLOAD = -1004
 +        private const val LAYOUT_CUSTOM = 5
-+        private const val STICK_RADIUS_DP = 60f
++        private const val POWER_STRIP = 0.3f
++        private const val DASH_WINDOW_MS = 220L
++        private const val DASH_NEUTRAL_MS = 50L
++        private const val QUICKLOAD_HOLD_MS = 500L
++
++        private val GOLD = Color.rgb(233, 196, 106)
++        private val IVORY = Color.rgb(255, 247, 224)
++        private val NAVY = Color.argb(170, 22, 40, 98)
++        private val NAVY_SOFT = Color.argb(70, 22, 40, 98)
++        private val SKY = Color.argb(210, 70, 130, 235)
++        private val SKY_LIGHT = Color.rgb(140, 200, 255)
++
 +        const val PREF_ENABLED = "kiu_enabled"
 +        const val PREF_AUTOFIRE = "kiu_autofire"
++        const val PREF_DASH_ASSIST = "kiu_dash_assist"
++        const val PREF_SHOW_AB = "kiu_show_ab"
++        const val PREF_HAPTICS = "kiu_haptics"
++        const val PREF_STICK_ALPHA = "kiu_stick_alpha"
++        const val PREF_STICK_SIZE = "kiu_stick_size"
++        const val PREF_BUTTON_ALPHA = "kiu_button_alpha"
++        const val PREF_AIM_SENS = "kiu_aim_sens"
++        const val PREF_BTN_PREFIX = "kiu_btn_"
 +    }
 +}
 diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
