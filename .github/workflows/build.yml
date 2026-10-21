@@ -5,6 +5,13 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: write
+
+concurrency:
+  group: kiu-build
+  cancel-in-progress: true
+
 env:
   AZAHAR_TAG: "2126.2"
 
@@ -29,7 +36,9 @@ jobs:
 
       - name: Apply KIU changes
         working-directory: azahar
-        run: git apply --whitespace=nowarn ../kiu/.github/workflows/kiu.patch
+        run: |
+          git apply --whitespace=nowarn ../kiu/.github/workflows/kiu.patch
+          grep -o 'KIU_VERSION = "[^"]*"' src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt
 
       - name: Cache
         uses: actions/cache@v4
@@ -60,11 +69,16 @@ jobs:
           chmod +x ./gradlew
           ./gradlew assembleVanillaRelease
           mkdir -p $GITHUB_WORKSPACE/out
-          find app/build/outputs/apk -name "*.apk" -exec cp {} $GITHUB_WORKSPACE/out/Azahar-KIU.apk \;
+          APK=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+          if [ -z "$APK" ]; then echo "No APK was produced"; exit 1; fi
+          cp "$APK" $GITHUB_WORKSPACE/out/Azahar-KIU-build-${{ github.run_number }}.apk
           ls -la $GITHUB_WORKSPACE/out
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
         with:
-          name: Azahar-KIU-apk
-          path: out/Azahar-KIU.apk
+          tag_name: kiu-build-${{ github.run_number }}
+          name: Azahar KIU build ${{ github.run_number }}
+          body: Built from commit ${{ github.sha }}. Download the .apk below and install it over the old app.
+          files: out/*.apk
+          make_latest: true

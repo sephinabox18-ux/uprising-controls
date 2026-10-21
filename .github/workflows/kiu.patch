@@ -55,10 +55,10 @@ index 06c5ff2..efe130f 100644
          val isActionDown =
 diff --git a/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt b/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt
 new file mode 100644
-index 0000000..c113977
+index 0000000..2f8c4fb
 --- /dev/null
 +++ b/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt
-@@ -0,0 +1,1272 @@
+@@ -0,0 +1,1278 @@
 +// Personal modification for playing Kid Icarus: Uprising with phone-native touch controls.
 +// Licensed under GPLv2 or any later version, same as Azahar.
 +
@@ -150,6 +150,7 @@ index 0000000..c113977
 +    private var viewW = 0
 +    private var viewH = 0
 +    private var laidOut = false
++    private var announced = false
 +
 +    /** false = game view (top screen big), true = bottom screen big */
 +    private var bottomBig = false
@@ -278,6 +279,10 @@ index 0000000..c113977
 +        computeGeometry()
 +        loadButtonLayout()
 +        applyScreenLayout()
++        if (!announced) {
++            announced = true
++            toast("Uprising controls $KIU_VERSION")
++        }
 +    }
 +
 +    private fun computeGeometry() {
@@ -981,7 +986,7 @@ index 0000000..c113977
 +        val scroll = ScrollView(ctx).apply { addView(column) }
 +        var startEditing = false
 +        MaterialAlertDialogBuilder(ctx)
-+            .setTitle("Uprising controls")
++            .setTitle("Uprising controls $KIU_VERSION")
 +            .setView(scroll)
 +            .setPositiveButton("Done", null)
 +            .setNeutralButton("Edit layout") { _, _ -> startEditing = true }
@@ -1287,6 +1292,7 @@ index 0000000..c113977
 +    }
 +
 +    companion object {
++        const val KIU_VERSION = "v3"
 +        private const val ACTION_SETTINGS = -1001
 +        private const val ACTION_QUICKSAVE = -1003
 +        private const val ACTION_QUICKLOAD = -1004
