@@ -55,10 +55,10 @@ index 06c5ff2..efe130f 100644
          val isActionDown =
 diff --git a/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt b/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt
 new file mode 100644
-index 0000000..2f8c4fb
+index 0000000..e4c213d
 --- /dev/null
 +++ b/src/android/app/src/main/java/org/citra/citra_emu/overlay/KiuController.kt
-@@ -0,0 +1,1278 @@
+@@ -0,0 +1,1316 @@
 +// Personal modification for playing Kid Icarus: Uprising with phone-native touch controls.
 +// Licensed under GPLv2 or any later version, same as Azahar.
 +
@@ -97,13 +97,12 @@ index 0000000..2f8c4fb
 +import org.citra.citra_emu.utils.EmulationMenuSettings
 +
 +/**
-+ * "KIU mode" v3 for Kid Icarus: Uprising. One job per control:
-+ *  - Left: fixed joystick (placed in the layout editor) = Circle Pad, with a smooth ramp so
-+ *    the game never mistakes a normal push for a dash.
-+ *  - Right side: camera / aim trackpad driving an invisible stylus that stays pressed, so the
-+ *    view holds when you lift your thumb. It re-centres itself at the edges for endless turning.
-+ *  - FIRE: tap toggles continuous fire, hold fires while held.
-+ *  - DASH: tap = dodge, hold = sprint, in the joystick direction.
++ * "KIU mode" v4 for Kid Icarus: Uprising.
++ *  - Joystick (left): modern floating stick. Base appears under your thumb and returns home on
++ *    release. Push past the rim to sprint; flick past it and let go to dodge.
++ *  - Right side, empty area: CAMERA. Fast, endless turning, never fires.
++ *  - FIRE button: tap toggles continuous fire. Press and drag on it to aim precisely while firing.
++ *  - Both drive one invisible stylus on the 3DS touch screen that stays pressed so aim holds.
 + *  - Small bottom screen in the left bar: tap to swap screens; its bottom strip = powers.
 + */
 +class KiuController(private val overlay: InputOverlay) {
@@ -142,9 +141,12 @@ index 0000000..2f8c4fb
 +    private var haptics = prefs.getBoolean(PREF_HAPTICS, true)
 +    private var stickAlpha = prefs.getFloat(PREF_STICK_ALPHA, 0.6f)
 +    private var buttonAlpha = prefs.getFloat(PREF_BUTTON_ALPHA, 0.8f)
-+    private var camSens = prefs.getFloat(PREF_CAM_SENS, 1.0f)
++    private var camSens = prefs.getFloat(PREF_CAM_SENS, 1.5f)
++    private var aimSens = prefs.getFloat(PREF_AIM_SENS, 0.6f)
 +    private var camAccel = prefs.getFloat(PREF_CAM_ACCEL, 0.3f)
 +    private var holdAimMs = prefs.getFloat(PREF_HOLD_AIM, 1.5f) * 1000f
++    private var wrapPauseMs = prefs.getFloat(PREF_WRAP_PAUSE, 50f).toLong()
++    private var stickFollows = prefs.getBoolean(PREF_STICK_FOLLOW, true)
 +
 +    // ---------------------------------------------------------------- geometry
 +    private var viewW = 0
@@ -169,7 +171,6 @@ index 0000000..2f8c4fb
 +        KiuButton("a", "A", NativeLibrary.ButtonType.BUTTON_A, Show.MENU),
 +        KiuButton("b", "B", NativeLibrary.ButtonType.BUTTON_B, Show.MENU),
 +        KiuButton("power", "POWER", NativeLibrary.ButtonType.DPAD_DOWN, Show.GAME),
-+        KiuButton("dash", "DASH", ACTION_DASH, Show.GAME),
 +        fireButton,
 +        KiuButton("qs", "SAVE", ACTION_QUICKSAVE, Show.ALWAYS),
 +        KiuButton("ql", "LOAD", ACTION_QUICKLOAD, Show.ALWAYS)
@@ -180,23 +181,23 @@ index 0000000..2f8c4fb
 +
 +    // ---------------------------------------------------------------- joystick state
 +    private var stickId = -1
-+    private var targetX = 0f // where the thumb is asking the stick to be (dead-zoned)
++    private var baseX = 0f // where the stick base currently is (follows thumb-down if enabled)
++    private var baseY = 0f
++    private var targetX = 0f // what the thumb is asking for (dead-zoned, inside the rim)
 +    private var targetY = 0f
-+    private var thumbX = 0f // raw thumb position, for drawing
++    private var thumbX = 0f
 +    private var thumbY = 0f
 +    private var outX = 0f // what the game is actually getting
 +    private var outY = 0f
-+    private var lastDirX = 0f
-+    private var lastDirY = -1f
 +    private var lastTick = 0L
 +    private val stickRadius get() = stick.size / 2f
 +
-+    // ---------------------------------------------------------------- dash state
-+    private var dashActive = false
-+    private var dashStart = 0L
-+    private var dashReleased = false
-+    private var dashIsTap = false
-+    private var dashTapEnd = 0L
++    // Sprint: thumb pushed past the rim
++    private var sprintZone = false // thumb is currently past the rim
++    private var sprinting = false // latched sprint output
++    private var sprintStart = 0L
++    private var sprintDirX = 0f
++    private var sprintDirY = -1f
 +
 +    // ---------------------------------------------------------------- fire state
 +    private var fireOn = false
@@ -208,6 +209,16 @@ index 0000000..2f8c4fb
 +    private var camLastX = 0f
 +    private var camLastY = 0f
 +    private var camLastT = 0L
++
++    // Precise aim: finger pressed on FIRE and dragging
++    private var aimId = -1
++    private var aimLastX = 0f
++    private var aimLastY = 0f
++    private var aimDownX = 0f
++    private var aimDownY = 0f
++    private var aimLastT = 0L
++    private var aimMoved = 0f
++    private var wrapDir = 1
 +    private var lastCamMove = 0L
 +    private var stylusDown = false
 +    private var vx = 160f // virtual stylus, in 3DS touch-screen pixels
@@ -361,7 +372,7 @@ index 0000000..2f8c4fb
 +        }
 +        fun byId(id: String) = buttons.first { it.id == id }
 +
-+        // Right bar: [cog][start] / [A][B] ... POWER / DASH / FIRE
++        // Right bar: [cog][start] / [A][B] ... POWER / FIRE
 +        val small = min(dp(48f), (stripR - pad * 3f) / 2f)
 +        val colA = rightX + pad + small / 2f
 +        val colB = w - pad - small / 2f
@@ -373,14 +384,11 @@ index 0000000..2f8c4fb
 +        set(byId("b"), colA, row2 + small * 0.55f, small)
 +
 +        val midX = rightX + stripR / 2f
-+        val fire = min(dp(100f), stripR - pad * 2f)
++        val fire = min(dp(104f), stripR - pad * 2f)
 +        val fireCy = h - pad - fire / 2f
 +        set(fireButton, midX, fireCy, fire)
-+        val dash = min(dp(72f), stripR - pad * 2f)
-+        val dashCy = fireCy - fire / 2f - pad * 1.5f - dash / 2f
-+        set(byId("dash"), midX, dashCy, dash)
-+        val power = min(dp(56f), stripR - pad * 2f)
-+        set(byId("power"), midX, dashCy - dash / 2f - pad * 1.5f - power / 2f, power)
++        val power = min(dp(72f), stripR - pad * 2f)
++        set(byId("power"), midX, fireCy - fire / 2f - pad * 2f - power / 2f, power)
 +
 +        // Left bar: small screen, quick save / load, joystick at the bottom
 +        val q = min(dp(46f), (stripL - pad * 3f) / 2f)
@@ -467,7 +475,7 @@ index 0000000..2f8c4fb
 +        val slop = dp(4f)
 +        for (b in buttons) {
 +            if (isVisible(b) && b.pointerId == -1 && b.contains(x, y, slop)) {
-+                pressButton(b, id)
++                pressButton(b, id, x, y)
 +                return
 +            }
 +        }
@@ -499,6 +507,15 @@ index 0000000..2f8c4fb
 +        if (x < viewW / 2f) {
 +            if (stickId == -1) {
 +                stickId = id
++                if (stickFollows) {
++                    // Base appears under the thumb (kept fully on screen)
++                    val r = stickRadius
++                    baseX = x.coerceIn(r, viewW / 2f - r * 0.5f)
++                    baseY = y.coerceIn(r, viewH - r)
++                } else {
++                    baseX = stick.cx
++                    baseY = stick.cy
++                }
 +                updateStickTarget(x, y)
 +            }
 +        } else if (camId == -1) {
@@ -507,20 +524,32 @@ index 0000000..2f8c4fb
 +            camLastY = y
 +            camLastT = SystemClock.uptimeMillis()
 +            lastCamMove = camLastT
-+            if (!stylusDown && directId == -1 && wrapPhase == WRAP_NONE) {
-+                if (edgeWrap && nearEdge(vx, vy)) {
-+                    vx = 160f
-+                    vy = 120f
-+                }
-+                stylusPress()
-+            }
++            if (!stylusDown && directId == -1 && wrapPhase == WRAP_NONE) stylusPress()
 +        }
 +    }
 +
 +    private fun onMove(id: Int, x: Float, y: Float) {
 +        when (id) {
 +            stickId -> updateStickTarget(x, y)
-+            camId -> moveCamera(x, y)
++            camId -> {
++                val now = SystemClock.uptimeMillis()
++                val dt = max(1L, now - camLastT).toFloat()
++                moveStylus(x - camLastX, y - camLastY, dt, camSens, allowWrap = true)
++                camLastX = x
++                camLastY = y
++                camLastT = now
++            }
++
++            aimId -> {
++                val now = SystemClock.uptimeMillis()
++                val dt = max(1L, now - aimLastT).toFloat()
++                aimMoved = max(aimMoved, abs(x - aimDownX) + abs(y - aimDownY))
++                moveStylus(x - aimLastX, y - aimLastY, dt, aimSens, allowWrap = false)
++                aimLastX = x
++                aimLastY = y
++                aimLastT = now
++            }
++
 +            directId -> NativeLibrary.onTouchMoved(x, y)
 +        }
 +    }
@@ -537,6 +566,8 @@ index 0000000..2f8c4fb
 +                stickId = -1
 +                targetX = 0f
 +                targetY = 0f
++                sprintZone = false
++                sprinting = false
 +            }
 +
 +            camId -> {
@@ -565,9 +596,26 @@ index 0000000..2f8c4fb
 +        thumbX = x
 +        thumbY = y
 +        val r = stickRadius
-+        var nx = (x - stick.cx) / r
-+        var ny = (y - stick.cy) / r
-+        val len = sqrt(nx * nx + ny * ny)
++        val rx = (x - baseX) / r
++        val ry = (y - baseY) / r
++        val len = sqrt(rx * rx + ry * ry)
++        val dirX = if (len > 0.0001f) rx / len else 0f
++        val dirY = if (len > 0.0001f) ry / len else 0f
++
++        // Past the rim = sprint
++        if (len >= SPRINT_ENTER) {
++            sprintDirX = dirX
++            sprintDirY = dirY
++            if (!sprintZone) {
++                sprintZone = true
++                sprinting = true
++                sprintStart = SystemClock.uptimeMillis()
++            }
++        } else if (len < SPRINT_EXIT) {
++            sprintZone = false
++            sprinting = false
++        }
++
 +        if (len < STICK_DEADZONE) {
 +            targetX = 0f
 +            targetY = 0f
@@ -575,14 +623,8 @@ index 0000000..2f8c4fb
 +        }
 +        // Rescale so the stick starts moving right after the dead zone and tops out at the rim
 +        val mag = min((len - STICK_DEADZONE) / (1f - STICK_DEADZONE), 1f)
-+        nx /= len
-+        ny /= len
-+        targetX = nx * mag
-+        targetY = ny * mag
-+        if (mag > 0.25f) {
-+            lastDirX = nx
-+            lastDirY = ny
-+        }
++        targetX = dirX * mag
++        targetY = dirY * mag
 +    }
 +
 +    private fun tick() {
@@ -590,30 +632,25 @@ index 0000000..2f8c4fb
 +        val dt = (now - lastTick).coerceIn(0L, 50L).toFloat()
 +        lastTick = now
 +
-+        val wasDashing = dashActive
++        val wasSprinting = sprinting
 +        tickStick(now, dt)
 +        tickCamera(now)
-+        if (wasDashing != dashActive) overlay.invalidate()
++        if (wasSprinting != sprinting || stickId == -1) overlay.invalidate()
 +    }
 +
 +    private fun tickStick(now: Long, dt: Float) {
-+        if (dashActive) {
-+            val t = now - dashStart
-+            when {
-+                t < DASH_NEUTRAL_MS -> setStickOut(0f, 0f)
-+                !dashReleased -> setStickOut(lastDirX, lastDirY)
-+                dashIsTap && now < dashTapEnd -> setStickOut(lastDirX, lastDirY)
-+                dashIsTap && now < dashTapEnd + DASH_NEUTRAL_MS -> setStickOut(0f, 0f)
-+                else -> {
-+                    dashActive = false
-+                    setStickOut(0f, 0f)
-+                }
++        if (sprinting) {
++            // The game sprints on a fast flick from centre to edge: give it exactly that,
++            // then hold the stick fully out in the thumb's direction.
++            if (now - sprintStart < SPRINT_NEUTRAL_MS) {
++                setStickOut(0f, 0f)
++            } else {
++                setStickOut(sprintDirX, sprintDirY)
 +            }
 +            return
 +        }
 +
-+        // Smooth ramp outwards (the game reads a fast centre-to-edge push as a dash, so normal
-+        // movement must never get there instantly). Easing back in is immediate.
++        // Smooth ramp outwards so ordinary movement is never read as a dash; easing in is instant.
 +        val tMag = sqrt(targetX * targetX + targetY * targetY)
 +        val oMag = sqrt(outX * outX + outY * outY)
 +        if (tMag <= oMag || tMag < 0.001f) {
@@ -636,43 +673,26 @@ index 0000000..2f8c4fb
 +        )
 +    }
 +
-+    private fun startDash() {
-+        dashActive = true
-+        dashReleased = false
-+        dashStart = SystemClock.uptimeMillis()
-+    }
-+
-+    private fun releaseDash(held: Long) {
-+        if (!dashActive) return
-+        dashReleased = true
-+        dashIsTap = held < DASH_TAP_MS
-+        dashTapEnd = max(SystemClock.uptimeMillis(), dashStart + DASH_NEUTRAL_MS + DASH_DODGE_MS)
-+    }
-+
 +    // =================================================================== camera
 +
-+    private fun nearEdge(x: Float, y: Float): Boolean =
-+        x < EDGE_MARGIN || x > 320f - EDGE_MARGIN || y < EDGE_MARGIN || y > 240f - EDGE_MARGIN
-+
-+    private fun moveCamera(x: Float, y: Float) {
-+        val now = SystemClock.uptimeMillis()
-+        val dx = x - camLastX
-+        val dy = y - camLastY
-+        val dt = max(1L, now - camLastT).toFloat()
-+        camLastX = x
-+        camLastY = y
-+        camLastT = now
++    /**
++     * Moves the invisible stylus. Camera drags may wrap: when the stylus reaches the left/right
++     * edge it holds still, lifts long enough for the game to notice, and comes back down at the
++     * opposite edge so the turn carries on. Up/down simply stops at the edges.
++     */
++    private fun moveStylus(dx: Float, dy: Float, dt: Float, sens: Float, allowWrap: Boolean) {
 +        if (dx == 0f && dy == 0f) return
++        val now = SystemClock.uptimeMillis()
 +        lastCamMove = now
 +
 +        // Whole right half of the phone = one full width of the 3DS touch screen at 100%
 +        val base = 320f / (viewW / 2f)
 +        val speed = sqrt(dx * dx + dy * dy) / dt // phone px per ms
-+        val gain = base * camSens * (1f + camAccel * min(speed / 3f, 1f))
++        val gain = base * sens * (1f + camAccel * min(speed / 3f, 1f))
 +        val mx = dx * gain
 +        val my = dy * gain
 +
-+        if (directId != -1) return
++        if (directId != -1 || bottomBig) return
 +        if (wrapPhase != WRAP_NONE) {
 +            pendX += mx
 +            pendY += my
@@ -680,27 +700,24 @@ index 0000000..2f8c4fb
 +        }
 +
 +        vx += mx
-+        vy += my
-+        if (edgeWrap) {
-+            if (nearEdge(vx, vy)) {
-+                // Hold still, lift, and come back down in the centre, carrying the overflow
-+                pendX = vx - vx.coerceIn(EDGE_MARGIN, 320f - EDGE_MARGIN)
-+                pendY = vy - vy.coerceIn(EDGE_MARGIN, 240f - EDGE_MARGIN)
-+                vx = vx.coerceIn(EDGE_MARGIN, 320f - EDGE_MARGIN)
-+                vy = vy.coerceIn(EDGE_MARGIN, 240f - EDGE_MARGIN)
-+                wrapPhase = WRAP_FREEZE
-+                wrapT = now
-+            }
++        vy = (vy + my).coerceIn(EDGE_MARGIN, 240f - EDGE_MARGIN)
++        if (allowWrap && edgeWrap && (vx < EDGE_MARGIN || vx > 320f - EDGE_MARGIN)) {
++            val clamped = vx.coerceIn(EDGE_MARGIN, 320f - EDGE_MARGIN)
++            wrapDir = if (vx > clamped) 1 else -1
++            pendX = vx - clamped
++            pendY = 0f
++            vx = clamped
++            wrapPhase = WRAP_FREEZE
++            wrapT = now
 +        } else {
-+            vx = vx.coerceIn(1f, 319f)
-+            vy = vy.coerceIn(1f, 239f)
++            vx = vx.coerceIn(EDGE_MARGIN, 320f - EDGE_MARGIN)
 +        }
 +        if (stylusDown) stylusMove() else stylusPress()
 +    }
 +
 +    private fun tickCamera(now: Long) {
 +        when (wrapPhase) {
-+            WRAP_FREEZE -> if (now - wrapT >= WRAP_FREEZE_MS) {
++            WRAP_FREEZE -> if (now - wrapT >= wrapPauseMs) {
 +                if (stylusDown) {
 +                    NativeLibrary.onTouchEvent(0f, 0f, false)
 +                    stylusDown = false
@@ -709,9 +726,11 @@ index 0000000..2f8c4fb
 +                wrapT = now
 +            }
 +
-+            WRAP_LIFTED -> if (now - wrapT >= WRAP_LIFT_MS) {
-+                vx = (160f + pendX).coerceIn(EDGE_MARGIN + 1f, 320f - EDGE_MARGIN - 1f)
-+                vy = (120f + pendY).coerceIn(EDGE_MARGIN + 1f, 240f - EDGE_MARGIN - 1f)
++            WRAP_LIFTED -> if (now - wrapT >= wrapPauseMs) {
++                // Come back down on the opposite side, carrying any extra movement
++                val entry = if (wrapDir > 0) EDGE_MARGIN + 2f else 320f - EDGE_MARGIN - 2f
++                vx = (entry + pendX).coerceIn(EDGE_MARGIN + 1f, 320f - EDGE_MARGIN - 1f)
++                vy = (vy + pendY).coerceIn(EDGE_MARGIN, 240f - EDGE_MARGIN)
 +                pendX = 0f
 +                pendY = 0f
 +                wrapPhase = WRAP_NONE
@@ -720,7 +739,7 @@ index 0000000..2f8c4fb
 +            }
 +        }
 +
-+        if (camId == -1 && stylusDown && wrapPhase == WRAP_NONE) {
++        if (camId == -1 && aimId == -1 && stylusDown && wrapPhase == WRAP_NONE) {
 +            val hold = max(holdAimMs, MIN_STILL_MS.toFloat())
 +            if (now - lastCamMove >= hold) stylusRelease()
 +        }
@@ -785,7 +804,7 @@ index 0000000..2f8c4fb
 +        Toast.makeText(CitraApplication.appContext, text, Toast.LENGTH_SHORT).show()
 +    }
 +
-+    private fun pressButton(b: KiuButton, id: Int) {
++    private fun pressButton(b: KiuButton, id: Int, x: Float, y: Float) {
 +        b.pointerId = id
 +        b.downTime = SystemClock.uptimeMillis()
 +        buzz()
@@ -796,10 +815,19 @@ index 0000000..2f8c4fb
 +                toast("Quick saved")
 +            }
 +
-+            ACTION_DASH -> startDash()
 +            NativeLibrary.ButtonType.TRIGGER_L -> {
 +                fireWasOn = fireOn
 +                updateL()
++                // The same finger can now drag to aim precisely
++                aimId = id
++                aimLastX = x
++                aimLastY = y
++                aimDownX = x
++                aimDownY = y
++                aimLastT = b.downTime
++                aimMoved = 0f
++                lastCamMove = b.downTime
++                if (!stylusDown && directId == -1 && wrapPhase == WRAP_NONE) stylusPress()
 +            }
 +
 +            NativeLibrary.ButtonType.BUTTON_START -> {
@@ -827,11 +855,13 @@ index 0000000..2f8c4fb
 +                }
 +            }
 +
-+            ACTION_DASH -> releaseDash(held)
 +            NativeLibrary.ButtonType.TRIGGER_L -> {
-+                // Quick tap flips continuous fire; a longer hold just fired while held
-+                fireOn = if (fireTapToggles && held < FIRE_TAP_MS) !fireWasOn else fireWasOn
++                // A quick, still tap flips continuous fire; a hold or a drag just fired while held
++                val isTap = held < FIRE_TAP_MS && aimMoved < dp(14f)
++                fireOn = if (fireTapToggles && isTap) !fireWasOn else fireWasOn
 +                updateL()
++                aimId = -1
++                lastCamMove = SystemClock.uptimeMillis()
 +            }
 +
 +            else -> sendButton(b.action, false)
@@ -859,9 +889,11 @@ index 0000000..2f8c4fb
 +        stickId = -1
 +        targetX = 0f
 +        targetY = 0f
-+        dashActive = false
++        sprintZone = false
++        sprinting = false
 +        setStickOut(0f, 0f)
 +        camId = -1
++        aimId = -1
 +        stylusRelease()
 +        if (directId != -1) {
 +            NativeLibrary.onTouchEvent(0f, 0f, false)
@@ -873,7 +905,7 @@ index 0000000..2f8c4fb
 +    // =================================================================== frame ticker
 +
 +    private fun needsTick(): Boolean =
-+        stickId != -1 || dashActive || stylusDown || wrapPhase != WRAP_NONE ||
++        stickId != -1 || sprinting || stylusDown || wrapPhase != WRAP_NONE ||
 +            abs(outX) > 0.001f || abs(outY) > 0.001f
 +
 +    private fun scheduleTick() {
@@ -943,27 +975,42 @@ index 0000000..2f8c4fb
 +            fireTapToggles = it
 +            prefs.edit().putBoolean(PREF_FIRE_TOGGLE, it).apply()
 +        }
-+        note("On: a quick tap turns continuous fire on or off, holding fires while held. Off: FIRE only fires while held.")
++        note("Quick tap: continuous fire on/off. Press and drag on FIRE: fire while aiming precisely.")
++
++        slider("Camera turn speed (%)", 30f, 400f, 10f, camSens * 100f) {
++            camSens = it / 100f
++            prefs.edit().putFloat(PREF_CAM_SENS, camSens).apply()
++        }
++        note("Dragging on the empty right side. Turns the camera, never fires.")
++        slider("Aim precision speed (%)", 20f, 200f, 10f, aimSens * 100f) {
++            aimSens = it / 100f
++            prefs.edit().putFloat(PREF_AIM_SENS, aimSens).apply()
++        }
++        note("Dragging on FIRE. Lower = finer aim on targets.")
++        slider("Camera acceleration (%)", 0f, 100f, 10f, camAccel * 100f) {
++            camAccel = it / 100f
++            prefs.edit().putFloat(PREF_CAM_ACCEL, camAccel).apply()
++        }
 +
 +        toggle("Endless camera turning", edgeWrap) {
 +            edgeWrap = it
 +            prefs.edit().putBoolean(PREF_EDGE_WRAP, it).apply()
 +        }
-+        note("Re-centres the hidden stylus at the edges so you can keep turning. Turn off if aiming in the air battles feels jumpy at the screen edges.")
-+
-+        slider("Camera sensitivity (%)", 20f, 300f, 10f, camSens * 100f) {
-+            camSens = it / 100f
-+            prefs.edit().putFloat(PREF_CAM_SENS, camSens).apply()
++        slider("Endless turning pause (ms)", 20f, 200f, 10f, wrapPauseMs.toFloat()) {
++            wrapPauseMs = it.toLong()
++            prefs.edit().putFloat(PREF_WRAP_PAUSE, it).apply()
 +        }
-+        slider("Camera acceleration (%)", 0f, 100f, 10f, camAccel * 100f) {
-+            camAccel = it / 100f
-+            prefs.edit().putFloat(PREF_CAM_ACCEL, camAccel).apply()
-+        }
-+        note("Higher = fast swipes turn further, slow swipes stay precise.")
++        note("If turning still stops at the edge, raise this. If it hitches, lower it.")
 +        slider("Keep aim after lifting thumb (seconds)", 0f, 4f, 0.25f, holdAimMs / 1000f) {
 +            holdAimMs = it * 1000f
 +            prefs.edit().putFloat(PREF_HOLD_AIM, it).apply()
 +        }
++
++        toggle("Joystick follows your thumb", stickFollows) {
++            stickFollows = it
++            prefs.edit().putBoolean(PREF_STICK_FOLLOW, it).apply()
++        }
++        note("On: the stick appears where your thumb lands on the left side and returns home after. Off: fixed in place. Push past the rim to sprint.")
 +
 +        slider("Joystick visibility (0 = invisible)", 0f, 100f, 5f, stickAlpha * 100f) {
 +            stickAlpha = it / 100f
@@ -1089,8 +1136,9 @@ index 0000000..2f8c4fb
 +    private fun drawStick(canvas: Canvas, alpha: Float) {
 +        if (alpha <= 0f) return
 +        val r = stickRadius
-+        val cx = stick.cx
-+        val cy = stick.cy
++        val active = stickId != -1 && !editMode
++        val cx = if (active) baseX else stick.cx
++        val cy = if (active) baseY else stick.cy
 +        fillPaint.color = withAlpha(NAVY_SOFT, alpha)
 +        canvas.drawCircle(cx, cy, r, fillPaint)
 +        linePaint.strokeWidth = dp(2.5f)
@@ -1099,10 +1147,14 @@ index 0000000..2f8c4fb
 +        linePaint.strokeWidth = dp(1f)
 +        canvas.drawCircle(cx, cy, r - dp(5f), linePaint)
 +
-+        // Knob follows the thumb (clamped to the rim) so it always feels attached
++        // Sprint ring just outside the rim
++        linePaint.strokeWidth = if (sprinting) dp(4f) else dp(1.5f)
++        linePaint.color = withAlpha(if (sprinting) SKY_LIGHT else GOLD, alpha * (if (sprinting) 1f else 0.35f))
++        canvas.drawCircle(cx, cy, r * SPRINT_ENTER + dp(2f), linePaint)
++
 +        var kx = 0f
 +        var ky = 0f
-+        if (stickId != -1) {
++        if (active) {
 +            kx = (thumbX - cx) / r
 +            ky = (thumbY - cy) / r
 +            val len = sqrt(kx * kx + ky * ky)
@@ -1116,8 +1168,9 @@ index 0000000..2f8c4fb
 +        fillPaint.color = withAlpha(IVORY, alpha)
 +        canvas.drawCircle(px, py, r * 0.42f, fillPaint)
 +        linePaint.strokeWidth = dp(2f)
++        linePaint.color = withAlpha(GOLD, alpha)
 +        canvas.drawCircle(px, py, r * 0.42f, linePaint)
-+        fillPaint.color = withAlpha(if (dashActive) SKY else NAVY, alpha)
++        fillPaint.color = withAlpha(if (sprinting) SKY else NAVY, alpha)
 +        canvas.drawCircle(px, py, r * 0.16f, fillPaint)
 +    }
 +
@@ -1136,7 +1189,7 @@ index 0000000..2f8c4fb
 +
 +    private fun drawButton(canvas: Canvas, b: KiuButton, alpha: Float, highlight: Boolean = false) {
 +        val r = b.size / 2f
-+        val lit = b.pressed || (b === fireButton && fireOn) || (b.action == ACTION_DASH && dashActive)
++        val lit = b.pressed || (b === fireButton && fireOn)
 +        fillPaint.color = withAlpha(if (lit) SKY else NAVY, alpha)
 +        canvas.drawCircle(b.cx, b.cy, r, fillPaint)
 +        linePaint.color = withAlpha(if (highlight) SKY_LIGHT else GOLD, alpha)
@@ -1158,11 +1211,6 @@ index 0000000..2f8c4fb
 +            NativeLibrary.ButtonType.TRIGGER_L -> {
 +                drawArrow(canvas, b.cx, b.cy - r * 0.12f, r * 0.5f, ink)
 +                drawLabel(canvas, if (fireOn) "AUTO" else b.label, b.cx, b.cy + r * 0.48f, r * 0.26f, ink)
-+            }
-+
-+            ACTION_DASH -> {
-+                drawWing(canvas, b.cx, b.cy - r * 0.1f, r * 0.5f, ink)
-+                drawLabel(canvas, b.label, b.cx, b.cy + r * 0.5f, r * 0.26f, ink)
 +            }
 +
 +            NativeLibrary.ButtonType.DPAD_DOWN -> {
@@ -1196,16 +1244,6 @@ index 0000000..2f8c4fb
 +        canvas.drawPath(iconPath, fillPaint)
 +        canvas.drawLine(cx - s * 0.7f, cy + s * 0.7f, cx - s * 0.75f, cy + s * 0.3f, linePaint)
 +        canvas.drawLine(cx - s * 0.7f, cy + s * 0.7f, cx - s * 0.3f, cy + s * 0.75f, linePaint)
-+    }
-+
-+    /** A small wing: three swept feathers */
-+    private fun drawWing(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
-+        linePaint.color = color
-+        linePaint.strokeWidth = s * 0.17f
-+        for (k in 0 until 3) {
-+            val off = k * s * 0.32f
-+            canvas.drawLine(cx - s * 0.8f, cy + s * 0.35f - off * 0.3f, cx + s * 0.75f - off, cy - s * 0.55f + off, linePaint)
-+        }
 +    }
 +
 +    private fun drawBolt(canvas: Canvas, cx: Float, cy: Float, s: Float, color: Int) {
@@ -1292,29 +1330,26 @@ index 0000000..2f8c4fb
 +    }
 +
 +    companion object {
-+        const val KIU_VERSION = "v3"
++        const val KIU_VERSION = "v4"
 +        private const val ACTION_SETTINGS = -1001
 +        private const val ACTION_QUICKSAVE = -1003
 +        private const val ACTION_QUICKLOAD = -1004
-+        private const val ACTION_DASH = -1005
 +        private const val ACTION_STICK = -1006
 +        private const val LAYOUT_CUSTOM = 5
 +        private const val POWER_STRIP = 0.3f
 +
-+        private const val STICK_DEADZONE = 0.1f
-+        private const val STICK_RAMP_MS = 90f // centre to full push, normal movement
-+        private const val DASH_NEUTRAL_MS = 50L
-+        private const val DASH_DODGE_MS = 130L
-+        private const val DASH_TAP_MS = 220L
++        private const val STICK_DEADZONE = 0.08f
++        private const val STICK_RAMP_MS = 70f // centre to full push, normal movement
++        private const val SPRINT_ENTER = 1.12f // thumb distance (in stick radii) that starts a sprint
++        private const val SPRINT_EXIT = 0.85f
++        private const val SPRINT_NEUTRAL_MS = 50L
 +        private const val FIRE_TAP_MS = 250L
 +        private const val QUICKLOAD_HOLD_MS = 500L
 +
-+        private const val EDGE_MARGIN = 28f // 3DS pixels
++        private const val EDGE_MARGIN = 12f // 3DS pixels
 +        private const val WRAP_NONE = 0
 +        private const val WRAP_FREEZE = 1
 +        private const val WRAP_LIFTED = 2
-+        private const val WRAP_FREEZE_MS = 34L
-+        private const val WRAP_LIFT_MS = 17L
 +        private const val MIN_STILL_MS = 60L
 +
 +        private val GOLD = Color.rgb(233, 196, 106)
@@ -1331,7 +1366,10 @@ index 0000000..2f8c4fb
 +        const val PREF_HAPTICS = "kiu_haptics"
 +        const val PREF_STICK_ALPHA = "kiu_stick_alpha"
 +        const val PREF_BUTTON_ALPHA = "kiu_button_alpha"
-+        const val PREF_CAM_SENS = "kiu_cam_sens"
++        const val PREF_CAM_SENS = "kiu_cam_sens2"
++        const val PREF_AIM_SENS = "kiu_aim_sens2"
++        const val PREF_WRAP_PAUSE = "kiu_wrap_pause"
++        const val PREF_STICK_FOLLOW = "kiu_stick_follow"
 +        const val PREF_CAM_ACCEL = "kiu_cam_accel"
 +        const val PREF_HOLD_AIM = "kiu_hold_aim"
 +        const val PREF_BTN_PREFIX = "kiu_btn_"
